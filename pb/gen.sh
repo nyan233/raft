@@ -1,0 +1,1 @@
+protoc --go_out=. --go-lrpc_out=. raft.proto

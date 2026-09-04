@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package raft;
+option go_package = "message/raft";
+
+service raft {
+  rpc RequestVote(RequestVoteReq) returns (RequestVoteRsp);
+  rpc AppendEntries(AppendEntriesReq) returns (AppendEntriesRsp);
+}
+
+
+enum State {
+  StateNil = 0;
+  StateLeader = 1;
+  StateFollower = 2;
+  StateCandidate = 3;
+}
+
+message RequestVoteReq {
+  uint64 term = 1;
+  string candi_date_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message RequestVoteRsp {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+message AppendEntriesReq {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated Entry entries = 5;
+  uint64 leader_commit = 6;
+}
+
+message AppendEntriesRsp {
+  uint64 term = 1;
+}
+
+message Entry {
+  uint64 term = 1;
+  uint64 log_index = 2;
+  bytes command = 3;
+}
