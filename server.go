@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"log/slog"
 	"math/rand"
 	"sync"
 	"time"
@@ -23,24 +24,23 @@ type raftServer struct {
 }
 
 func newRaftServer(my string, membership []string) (*raftServer, error) {
-	h, err := newRaftRpcServer(my, membership)
-	if err != nil {
-		return nil, err
-	}
 	s := &raftServer{
-		rpcHelper:    h,
-		my:           my,
 		state:        raft.State_StateNil,
 		logs:         make([]raft.Entry, 0, 128),
 		lastLogIndex: 0,
 		lastLogTerm:  0,
 	}
+	h, err := newRaftRpcServer(s, my, membership)
+	if err != nil {
+		return nil, err
+	}
+	s.rpcHelper = h
 	return s, nil
 }
 
 func (s *raftServer) handleRequestVote(ctx *context.Context, req *raft.RequestVoteReq) (rsp *raft.RequestVoteRsp, err error) {
 	rsp = &raft.RequestVoteRsp{}
-	if s.my == req.CandiDateId {
+	if s.rpcHelper.getMy() == req.CandiDateId {
 		err = errors.New("invalid vote request")
 		return
 	}
@@ -66,7 +66,11 @@ func (s *raftServer) handleRequestVote(ctx *context.Context, req *raft.RequestVo
 
 func (s *raftServer) handleAppendEntries(ctx *context.Context, req *raft.AppendEntriesReq) (rsp *raft.AppendEntriesRsp, err error) {
 	if len(req.Entries) == 0 {
-		s.lastHeartbeat = time.Now()
+		_ = s.lockFunc(func() error {
+			s.state = raft.State_StateFollower
+			s.lastHeartbeat = time.Now()
+			return nil
+		})
 	}
 	return &raft.AppendEntriesRsp{}, nil
 }
@@ -95,30 +99,62 @@ func (s *raftServer) lockFunc(fn func() error) error {
 	return fn()
 }
 
-func (s *raftServer) candidateTimeout() {
-	if s.state == raft.State_StateNil {
-		s.lockFunc(func() error {
-			s.state = raft.State_StateCandidate
-			s.term++
-			voteCount := 1
-			for _, member := range s.membership {
-				vote, err := s.rpcHelper.callRequestVote(member, context.Background(), &raft.RequestVoteReq{
-					Term:         s.term,
-					CandiDateId:  s.my,
-					LastLogIndex: s.lastLogIndex,
-					LastLogTerm:  s.lastLogTerm,
-				})
-				if err != nil {
-					return err
-				}
-				if vote.VoteGranted {
-					voteCount++
-				}
+func (s *raftServer) enterCandidate() error {
+	return s.lockFunc(func() error {
+		s.state = raft.State_StateCandidate
+		s.term++
+		voteCount := 1
+		ctx := context.Background()
+		for _, member := range s.rpcHelper.getMemberShip() {
+			vote, err := s.rpcHelper.callRequestVote(member, ctx, &raft.RequestVoteReq{
+				Term:         s.term,
+				CandiDateId:  s.rpcHelper.getMy(),
+				LastLogIndex: s.lastLogIndex,
+				LastLogTerm:  s.lastLogTerm,
+			})
+			if err != nil {
+				return err
 			}
-			if voteCount > 2 {
-				s.state = raft.State_StateLeader
+			if vote.VoteGranted {
+				voteCount++
+			}
+		}
+		if voteCount > 2 {
+			s.state = raft.State_StateLeader
+			s.rpcHelper.setLeader(s.rpcHelper.getMy())
+			slog.Info("my is leader, call broadcastHeartbeatAllMemberShip", slog.String("my", s.rpcHelper.getMy()))
+			addr, err := s.rpcHelper.broadcastHeartbeatAllMemberShip(ctx, s.term, s.lastLogIndex, s.lastLogTerm, s.lastLogIndex)
+			if err != nil {
+				slog.Error(err.Error(), slog.String("addr", addr))
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *raftServer) candidateTimeout() {
+	switch s.state {
+	case raft.State_StateFollower:
+		var enterCandidate bool
+		_ = s.lockFunc(func() error {
+			now := time.Now()
+			if now.Sub(s.lastHeartbeat) > time.Second {
+				enterCandidate = true
 			}
 			return nil
 		})
+		if enterCandidate {
+			s.state = raft.State_StateCandidate
+			err := s.enterCandidate()
+			if err != nil {
+				slog.Error("request vote rpc err", slog.String("err", err.Error()))
+			}
+		}
+	case raft.State_StateCandidate, raft.State_StateNil:
+		err := s.enterCandidate()
+		if err != nil {
+			slog.Error("request vote rpc err", slog.String("err", err.Error()))
+		}
 	}
 }
