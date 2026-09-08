@@ -57,11 +57,11 @@ func (r *raftRpcHelper) RequestVote(ctx *context.Context, req *raft.RequestVoteR
 }
 
 func (r *raftRpcHelper) AppendEntries(ctx *context.Context, req *raft.AppendEntriesReq) (rsp *raft.AppendEntriesRsp, err error) {
-	reqJson, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	slog.Info("handleAppendEntries", slog.String("leaderId", req.LeaderId), slog.String("my", r.getMy()), slog.String("req", string(reqJson)))
+	//reqJson, err := json.Marshal(req)
+	//if err != nil {
+	//	return nil, err
+	//}
+	//slog.Info("handleAppendEntries", slog.String("leaderId", req.LeaderId), slog.String("my", r.getMy()), slog.String("req", string(reqJson)))
 	return r.rs.handleAppendEntries(ctx, req)
 }
 

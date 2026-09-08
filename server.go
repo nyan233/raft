@@ -12,15 +12,16 @@ import (
 )
 
 type raftServer struct {
-	mu            sync.Mutex
-	rpcHelper     *raftRpcHelper
-	state         raft.State
-	term          uint64
-	logs          []raft.Entry
-	lastLogIndex  uint64
-	lastLogTerm   uint64
-	lastHeartbeat time.Time
-	done          chan struct{}
+	mu             sync.Mutex
+	rpcHelper      *raftRpcHelper
+	state          raft.State
+	term           uint64
+	logs           []raft.Entry
+	lastLogIndex   uint64
+	lastLogTerm    uint64
+	lastHeartbeat  time.Time
+	done           chan struct{}
+	leaderHeCancel func()
 }
 
 func newRaftServer(my string, membership []string) (*raftServer, error) {
@@ -65,6 +66,7 @@ func (s *raftServer) handleRequestVote(ctx *context.Context, req *raft.RequestVo
 }
 
 func (s *raftServer) handleAppendEntries(ctx *context.Context, req *raft.AppendEntriesReq) (rsp *raft.AppendEntriesRsp, err error) {
+	slog.Info("leader append entries", slog.String("leader", req.LeaderId), slog.String("my", s.rpcHelper.getMy()))
 	if len(req.Entries) == 0 {
 		_ = s.lockFunc(func() error {
 			s.state = raft.State_StateFollower
@@ -91,6 +93,40 @@ func (s *raftServer) Init() error {
 		}
 	}()
 	return nil
+}
+
+func (s *raftServer) runLeaderHeartbeat(ctx *context.Context) {
+	go func() {
+		ticker := time.NewTicker(time.Millisecond * 10)
+		for {
+			select {
+			case <-ticker.C:
+				var (
+					term     uint64
+					logIndex uint64
+					logTerm  uint64
+				)
+				_ = s.lockFunc(func() error {
+					term = s.term
+					logIndex = s.lastLogIndex
+					logTerm = s.lastLogTerm
+					return nil
+				})
+				addr, err := s.rpcHelper.broadcastHeartbeatAllMemberShip(ctx, term, logIndex, logTerm, logIndex)
+				if err != nil {
+					slog.Error(err.Error(), slog.String("addr", addr))
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func (s *raftServer) cancelLeaderHeartbeat() {
+	if s.leaderHeCancel != nil {
+		s.leaderHeCancel()
+	}
 }
 
 func (s *raftServer) lockFunc(fn func() error) error {
@@ -128,6 +164,9 @@ func (s *raftServer) enterCandidate() error {
 				slog.Error(err.Error(), slog.String("addr", addr))
 				return err
 			}
+			var ctx2 *context.Context
+			ctx2, s.leaderHeCancel = context.WithCancel(context.Background())
+			s.runLeaderHeartbeat(ctx2)
 		}
 		return nil
 	})
