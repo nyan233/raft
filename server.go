@@ -141,17 +141,19 @@ func (s *raftServer) enterCandidate() error {
 		s.term++
 		voteCount := 1
 		ctx := context.Background()
-		for _, member := range s.rpcHelper.getMemberShip() {
-			vote, err := s.rpcHelper.callRequestVote(member, ctx, &raft.RequestVoteReq{
-				Term:         s.term,
-				CandiDateId:  s.rpcHelper.getMy(),
-				LastLogIndex: s.lastLogIndex,
-				LastLogTerm:  s.lastLogTerm,
-			})
-			if err != nil {
-				return err
-			}
-			if vote.VoteGranted {
+		pRsp, err := s.rpcHelper.parallelRequestVote(ctx, &raft.RequestVoteReq{
+			Term:         s.term,
+			CandiDateId:  s.rpcHelper.getMy(),
+			LastLogIndex: s.lastLogIndex,
+			LastLogTerm:  s.lastLogTerm,
+		})
+		if err != nil {
+			return err
+		}
+		for _, iRsp := range pRsp {
+			if iRsp.err != nil {
+				return iRsp.err
+			} else if iRsp.result.VoteGranted {
 				voteCount++
 			}
 		}

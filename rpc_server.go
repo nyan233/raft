@@ -2,7 +2,9 @@ package raft
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/nyan233/littlerpc/core/client"
 	"github.com/nyan233/littlerpc/core/common/context"
@@ -10,6 +12,11 @@ import (
 	"github.com/nyan233/littlerpc/core/server"
 	"github.com/nyan233/raft/pb/message/raft"
 )
+
+type rpcResult[T any] struct {
+	result *T
+	err    error
+}
 
 type raftRpcHelper struct {
 	cp         raft.RaftProxy
@@ -108,18 +115,86 @@ func (r *raftRpcHelper) getMy() string {
 	return r.my
 }
 
+func (r *raftRpcHelper) parallelRequestVote(ctx *context.Context, req *raft.RequestVoteReq) (rsp map[string]*rpcResult[raft.RequestVoteRsp], err error) {
+	membershipRes := make([]rpcResult[raft.RequestVoteRsp], len(r.membership))
+	wg := sync.WaitGroup{}
+	wg.Add(len(r.membership))
+	for idx, member := range r.membership {
+		go func(idx2 int, member2 string) {
+			defer wg.Done()
+			defer func() {
+				if err := recover(); err != nil {
+					errI, ok := err.(error)
+					if ok {
+						membershipRes[idx] = rpcResult[raft.RequestVoteRsp]{result: nil, err: errI}
+					} else {
+						membershipRes[idx] = rpcResult[raft.RequestVoteRsp]{result: nil, err: fmt.Errorf("%v", err)}
+					}
+				}
+			}()
+			reqJson, err := json.Marshal(req)
+			if err != nil {
+				panic(err)
+			}
+			res, err := r.cp.RequestVote(ctx, req, client.WithAddr(member2))
+			if err != nil {
+				membershipRes[idx2] = rpcResult[raft.RequestVoteRsp]{result: nil, err: err}
+			} else {
+				membershipRes[idx2] = rpcResult[raft.RequestVoteRsp]{result: res, err: nil}
+			}
+			rspJson, err := json.Marshal(res)
+			if err != nil {
+				panic(err)
+			}
+			slog.Info("callRequestVote",
+				slog.String("src", r.getMy()),
+				slog.String("target", member2),
+				slog.String("req", string(reqJson)),
+				slog.String("rsp", string(rspJson)))
+		}(idx, member)
+	}
+	wg.Wait()
+	rsp = make(map[string]*rpcResult[raft.RequestVoteRsp])
+	for idx := range membershipRes {
+		rsp[r.membership[idx]] = &membershipRes[idx]
+	}
+	return rsp, nil
+}
+
 func (r *raftRpcHelper) broadcastHeartbeatAllMemberShip(ctx *context.Context, term, logIndex, logTerm, leaderCommit uint64) (string, error) {
-	for _, member := range r.membership {
-		_, err := r.cp.AppendEntries(ctx, &raft.AppendEntriesReq{
-			Term:         term,
-			LeaderId:     r.leader,
-			PrevLogIndex: logIndex,
-			PrevLogTerm:  logTerm,
-			Entries:      nil,
-			LeaderCommit: leaderCommit,
-		}, client.WithAddr(member))
+	membershipErrs := make([]error, len(r.membership))
+	wg := sync.WaitGroup{}
+	wg.Add(len(r.membership))
+	for idx, member := range r.membership {
+		go func(idx2 int, member2 string) {
+			defer wg.Done()
+			defer func() {
+				if err := recover(); err != nil {
+					errI, ok := err.(error)
+					if ok {
+						membershipErrs[idx] = errI
+					} else {
+						membershipErrs[idx] = fmt.Errorf("%v", err)
+					}
+				}
+			}()
+			_, err := r.cp.AppendEntries(ctx, &raft.AppendEntriesReq{
+				Term:         term,
+				LeaderId:     r.leader,
+				PrevLogIndex: logIndex,
+				PrevLogTerm:  logTerm,
+				Entries:      nil,
+				LeaderCommit: leaderCommit,
+			}, client.WithAddr(member2))
+			if err != nil {
+				membershipErrs[idx2] = err
+			}
+		}(idx, member)
+	}
+	wg.Wait()
+	for idx, err := range membershipErrs {
 		if err != nil {
-			return member, err
+			return r.membership[idx], err
 		}
 	}
 	return "", nil
