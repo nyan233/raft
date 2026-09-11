@@ -3,7 +3,7 @@ package raft
 
 /*
    @Generator   : protoc-gen-go-lrpc
-   @CreateTime  : 2026-09-04 19:11:44.287409 +0800 CST
+   @CreateTime  : 2026-09-11 19:07:39.362435 +0800 CST
    @Author      : NoAuthor
    @Comment     : code is auto generate do not edit
 */
@@ -17,6 +17,7 @@ import (
 type RaftServer interface {
 	RequestVote(ctx *context.Context, req *RequestVoteReq) (rsp *RequestVoteRsp, err error)
 	AppendEntries(ctx *context.Context, req *AppendEntriesReq) (rsp *AppendEntriesRsp, err error)
+	InstallSnapshot(ctx *context.Context, req *InstallSnapshotReq) (rsp *InstallSnapshotRsp, err error)
 }
 
 type UnImplRaftServer struct{}
@@ -26,6 +27,10 @@ func (s UnImplRaftServer) RequestVote(ctx *context.Context, req *RequestVoteReq)
 }
 
 func (s UnImplRaftServer) AppendEntries(ctx *context.Context, req *AppendEntriesReq) (rsp *AppendEntriesRsp, err error) {
+	panic("not implemented")
+}
+
+func (s UnImplRaftServer) InstallSnapshot(ctx *context.Context, req *InstallSnapshotReq) (rsp *InstallSnapshotRsp, err error) {
 	panic("not implemented")
 }
 
@@ -39,6 +44,10 @@ var RaftServerDesc = server.Desc{
 			},
 			{
 				Name:    "AppendEntries",
+				Options: nil,
+			},
+			{
+				Name:    "InstallSnapshot",
 				Options: nil,
 			},
 		},

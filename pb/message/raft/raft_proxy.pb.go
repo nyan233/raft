@@ -3,7 +3,7 @@ package raft
 
 /*
    @Generator   : protoc-gen-go-lrpc
-   @CreateTime  : 2026-09-04 19:11:44.285853 +0800 CST
+   @CreateTime  : 2026-09-11 19:07:39.36178 +0800 CST
    @Author      : NoAuthor
    @Comment     : code is auto generate do not edit
 */
@@ -14,30 +14,31 @@ import (
 )
 
 var (
-	_ callerd3cd933bf4cd4a75817eca137d7222f3 = new(client.Client)
+	_ callera2c4bfe0da18477ab57295ac6b3eb187 = new(client.Client)
 	_ RaftProxy                              = new(raftImpl)
 )
 
-type callerd3cd933bf4cd4a75817eca137d7222f3 interface {
+type callera2c4bfe0da18477ab57295ac6b3eb187 interface {
 	Request2(service string, opts []client.CallOption, reqCount int, args ...interface{}) error
 }
 
 type RaftProxy interface {
 	RequestVote(a0 *context.Context, a1 *RequestVoteReq, opts ...client.CallOption) (r0 *RequestVoteRsp, r1 error)
 	AppendEntries(a0 *context.Context, a1 *AppendEntriesReq, opts ...client.CallOption) (r0 *AppendEntriesRsp, r1 error)
+	InstallSnapshot(a0 *context.Context, a1 *InstallSnapshotReq, opts ...client.CallOption) (r0 *InstallSnapshotRsp, r1 error)
 }
 
 type raftImpl struct {
-	callerd3cd933bf4cd4a75817eca137d7222f3
+	callera2c4bfe0da18477ab57295ac6b3eb187
 }
 
-func NewRaft(b callerd3cd933bf4cd4a75817eca137d7222f3) RaftProxy {
+func NewRaft(b callera2c4bfe0da18477ab57295ac6b3eb187) RaftProxy {
 	proxy := new(raftImpl)
-	c, ok := b.(callerd3cd933bf4cd4a75817eca137d7222f3)
+	c, ok := b.(callera2c4bfe0da18477ab57295ac6b3eb187)
 	if !ok {
 		panic("the argument is not implemented caller")
 	}
-	proxy.callerd3cd933bf4cd4a75817eca137d7222f3 = c
+	proxy.callera2c4bfe0da18477ab57295ac6b3eb187 = c
 	return proxy
 }
 
@@ -50,5 +51,11 @@ func (p raftImpl) RequestVote(a0 *context.Context, a1 *RequestVoteReq, opts ...c
 func (p raftImpl) AppendEntries(a0 *context.Context, a1 *AppendEntriesReq, opts ...client.CallOption) (r0 *AppendEntriesRsp, r1 error) {
 	r0 = new(AppendEntriesRsp)
 	r1 = p.Request2("raft.AppendEntries", opts, 2, a0, a1, r0)
+	return
+}
+
+func (p raftImpl) InstallSnapshot(a0 *context.Context, a1 *InstallSnapshotReq, opts ...client.CallOption) (r0 *InstallSnapshotRsp, r1 error) {
+	r0 = new(InstallSnapshotRsp)
+	r1 = p.Request2("raft.InstallSnapshot", opts, 2, a0, a1, r0)
 	return
 }
