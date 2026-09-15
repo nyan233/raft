@@ -12,8 +12,14 @@ node3=192.168.0.3, 创建完成之后就可以进入选举阶段
 
 ## raft log
 `raft`定义了一个`SM`，这个`SM`可以运行用户逻辑，用户逻辑可以任何满足SM接口的实现，比如可以包装的lsm/btree甚至简单的
-计数器都可以，`SM`通常只需要apply command
-raft的log
+计数器都可以，`SM`通常只需要apply command/recall command
+
+### log design
+raft log设计为一个文件组, 有`idx`&`data`文件, `idx`仅存储log元数据, 不存储实际的数据, data实际上是heap, 存储实际数据.
+一般检测到data文件大于1GB的时候就可以开始归档了, 会分裂成多个seg, 后台合并进程会检测commitIndex >= seg的文件.
+状态机需要可以应用raft发来的log command, 必要的时候也可以recall这些command, 比如`follower`有与当前`leader`不一致的日志, 那么则
+需要丢弃这些内容.
+状态机还要可以允许生成自己内部的快照, 以供`leader`快速将自己的数据同步给`follower`
 
 ## raft client
 

@@ -1,9 +1,11 @@
 package raft
 
 import (
+	"cmp"
 	"errors"
 	"log/slog"
 	"math/rand"
+	"slices"
 	"sync"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 type raftServer struct {
 	mu             sync.Mutex
 	rpcHelper      *raftRpcHelper
+	logMgr         *raftLogManager
 	state          raft.State
 	term           uint64
 	logs           []raft.Entry
@@ -67,14 +70,32 @@ func (s *raftServer) handleRequestVote(ctx *context.Context, req *raft.RequestVo
 
 func (s *raftServer) handleAppendEntries(ctx *context.Context, req *raft.AppendEntriesReq) (rsp *raft.AppendEntriesRsp, err error) {
 	slog.Info("leader append entries", slog.String("leader", req.LeaderId), slog.String("my", s.rpcHelper.getMy()))
-	if len(req.Entries) == 0 {
-		_ = s.lockFunc(func() error {
+	rsp = new(raft.AppendEntriesRsp)
+	err = s.lockFunc(func() error {
+		if s.term > req.Term {
+			return errors.New("term is greater than current term")
+		}
+		if s.lastLogIndex > req.PrevLogIndex {
+			return errors.New("prev log is greater than current log index")
+		}
+		if len(req.Entries) == 0 {
 			s.state = raft.State_StateFollower
 			s.lastHeartbeat = time.Now()
 			return nil
-		})
-	}
-	return &raft.AppendEntriesRsp{}, nil
+		} else {
+			maxTermEntry := slices.MaxFunc(req.Entries, func(a, b *raft.Entry) int {
+				return cmp.Compare(a.Term, b.Term)
+			})
+			err = s.logMgr.applyLog(ctx, req.Entries)
+			if err != nil {
+				return err
+			}
+			rsp.Term = s.term
+			s.term = maxTermEntry.Term
+		}
+		return nil
+	})
+	return rsp, err
 }
 
 func (s *raftServer) Init() error {

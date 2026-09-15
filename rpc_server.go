@@ -20,7 +20,6 @@ type rpcResult[T any] struct {
 
 type raftRpcHelper struct {
 	cp         raft.RaftProxy
-	rs         *raftServer
 	s          *server.Server
 	my         string
 	leader     string

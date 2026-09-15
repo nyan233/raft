@@ -7,6 +7,7 @@ service raft {
   rpc RequestVote(RequestVoteReq) returns (RequestVoteRsp);
   rpc AppendEntries(AppendEntriesReq) returns (AppendEntriesRsp);
   rpc InstallSnapshot(InstallSnapshotReq) returns (InstallSnapshotRsp);
+  rpc GetLeader(GetLeaderReq) returns (GetLeaderRsp);
 }
 
 
@@ -60,4 +61,13 @@ message InstallSnapshotReq {
 
 message InstallSnapshotRsp {
   uint64 term = 1;
+}
+
+message GetLeaderReq {
+
+}
+
+message GetLeaderRsp {
+  string leader_id = 1;
+  string leader_ip = 2;
 }
