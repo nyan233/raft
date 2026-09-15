@@ -3,7 +3,9 @@ package raft
 import (
 	"cmp"
 	"errors"
+	"fmt"
 	"log/slog"
+	"math/rand"
 	"slices"
 	"time"
 
@@ -18,6 +20,8 @@ const (
 	smCommandAppendEntries
 	smCommandLeaderHeartBeat
 	smCommandExecHeartBeat
+	smCommandAppendCommands
+	smCommandGetLeader
 )
 
 type smCommandRes struct {
@@ -33,18 +37,16 @@ type smCommand struct {
 }
 
 type CoreSmConfig struct {
-	My         string
-	Membership []string
-	LogDir     string
-	LogName    string
+	My            string
+	Membership    []string
+	LogDir        string
+	LogName       string
+	UserSmFactory func() StateMachine
 }
 
 type CoreSm struct {
 	cfg                 CoreSmConfig
 	state               raft.State
-	lastLogIndex        uint64
-	lastLogTerm         uint64
-	lastCommitIndex     uint64
 	term                uint64
 	q                   chan smCommand
 	heartbeatTicker     *time.Ticker
@@ -67,7 +69,33 @@ func (s *CoreSm) Init() error {
 	if err != nil {
 		return err
 	}
+	s.logMgr = newRaftLogManager(s.cfg.LogDir, s.cfg.LogName, s.cfg.UserSmFactory())
+	err = s.logMgr.init()
+	if err != nil {
+		return err
+	}
+	if s.term == 0 {
+		s.term = s.logMgr.lastLogTerm
+	}
+	go s.startLoop()
+	s.startTimeoutTicker()
 	return nil
+}
+
+func (s *CoreSm) myIsLeader() bool {
+	return s.state == raft.State_StateLeader && s.rpc.My == s.rpc.Leader
+}
+
+func (s *CoreSm) getLastLogIndex() uint64 {
+	return s.logMgr.lastLogIndex
+}
+
+func (s *CoreSm) getLastLogTerm() uint64 {
+	return s.logMgr.lastLogTerm
+}
+
+func (s *CoreSm) getLastCommitIndex() uint64 {
+	return s.logMgr.lastCommitIndex
 }
 
 func (s *CoreSm) startTimeoutTicker() {
@@ -76,11 +104,34 @@ func (s *CoreSm) startTimeoutTicker() {
 		for {
 			select {
 			case <-ticker.C:
-				s.q <- smCommand{
+				cmd := smCommand{
 					typ: smCommandExecHeartBeat,
 					ctx: context.Background(),
 					req: nil,
-					cq:  nil,
+					cq:  make(chan smCommandRes, 1),
+				}
+				s.q <- cmd
+				select {
+				case <-cmd.cq:
+					break
+				}
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-time.After(time.Duration(150+rand.Int63n(150)) * time.Millisecond):
+				cmd := smCommand{
+					typ: smCommandCandidateTimeout,
+					ctx: context.Background(),
+					req: nil,
+					cq:  make(chan smCommandRes, 1),
+				}
+				s.q <- cmd
+				select {
+				case <-cmd.cq:
+					break
 				}
 			}
 		}
@@ -108,7 +159,10 @@ func (s *CoreSm) startLoop() {
 					Err: err,
 				}
 			case smCommandCandidateTimeout:
-				var enterCandidate bool
+				var (
+					enterCandidate bool
+					err            error
+				)
 				if s.state == raft.State_StateFollower {
 					now := time.Now()
 					if now.Sub(s.lastLeaderHeartBeat) > time.Second {
@@ -119,10 +173,18 @@ func (s *CoreSm) startLoop() {
 				}
 				if enterCandidate {
 					s.state = raft.State_StateCandidate
-					err := s.enterCandidate()
+					err = s.enterCandidate()
 					if err != nil {
-						slog.Error("request vote rpc err", slog.String("err", err.Error()))
+						slog.Error("request vote rpc",
+							slog.String("err", err.Error()),
+							slog.String("my", s.rpc.My),
+							slog.String("member", fmt.Sprintf("%v", s.rpc.Membership)),
+						)
 					}
+				}
+				cmd.cq <- smCommandRes{
+					Rsp: nil,
+					Err: err,
 				}
 			case smCommandLeaderHeartBeat:
 				rsp, err := s.execLeaderHeartBeatFromLoop(cmd.ctx, cmd.req.(*raft.AppendEntriesReq))
@@ -132,19 +194,39 @@ func (s *CoreSm) startLoop() {
 				}
 			case smCommandExecHeartBeat:
 				if s.state != raft.State_StateLeader {
+					cmd.cq <- smCommandRes{
+						Rsp: nil,
+						Err: nil,
+					}
 					break
 				}
 				// TODO 有超时的情况会堵很久, 优化一下
-				addr, err := s.rpc.broadcastHeartbeatAllMemberShip(cmd.ctx, &raft.AppendEntriesReq{
+				addr, err := s.rpc.broadcastAppendEntries2AllMemberShip(cmd.ctx, &raft.AppendEntriesReq{
 					Term:         s.term,
 					LeaderId:     s.rpc.My,
-					PrevLogIndex: s.lastLogIndex,
-					PrevLogTerm:  s.lastLogTerm,
+					PrevLogIndex: s.getLastLogIndex(),
+					PrevLogTerm:  s.getLastLogTerm(),
 					Entries:      nil,
-					LeaderCommit: s.lastCommitIndex,
+					LeaderCommit: s.getLastCommitIndex(),
 				})
 				if err != nil {
 					slog.Error(err.Error(), slog.String("addr", addr))
+				}
+				cmd.cq <- smCommandRes{
+					Rsp: nil,
+					Err: err,
+				}
+			case smCommandAppendCommands:
+				rsp, err := s.execAppendCommandsFromLoop(cmd.ctx, cmd.req.(*raft.AppendCommandsReq))
+				cmd.cq <- smCommandRes{
+					Rsp: rsp,
+					Err: err,
+				}
+			case smCommandGetLeader:
+				rsp, err := s.execGetLeaderFromLoop(cmd.ctx, cmd.req.(*raft.GetLeaderReq))
+				cmd.cq <- smCommandRes{
+					Rsp: rsp,
+					Err: err,
 				}
 			}
 		}
@@ -159,8 +241,8 @@ func (s *CoreSm) enterCandidate() error {
 	pRsp, err := s.rpc.parallelRequestVote(ctx, &raft.RequestVoteReq{
 		Term:         s.term,
 		CandiDateId:  s.rpc.My,
-		LastLogIndex: s.lastLogIndex,
-		LastLogTerm:  s.lastLogTerm,
+		LastLogIndex: s.getLastLogIndex(),
+		LastLogTerm:  s.getLastLogTerm(),
 	})
 	if err != nil {
 		return err
@@ -175,14 +257,14 @@ func (s *CoreSm) enterCandidate() error {
 	if voteCount > 2 {
 		s.state = raft.State_StateLeader
 		s.rpc.Leader = s.rpc.My
-		slog.Info("my is leader, call broadcastHeartbeatAllMemberShip", slog.String("my", s.rpcHelper.getMy()))
-		addr, err := s.rpc.broadcastHeartbeatAllMemberShip(ctx, &raft.AppendEntriesReq{
+		slog.Info("my is leader, call broadcastAppendEntries2AllMemberShip", slog.String("my", s.rpc.My))
+		addr, err := s.rpc.broadcastAppendEntries2AllMemberShip(ctx, &raft.AppendEntriesReq{
 			Term:         s.term,
 			LeaderId:     s.rpc.My,
-			PrevLogIndex: s.lastLogIndex,
-			PrevLogTerm:  s.lastLogTerm,
+			PrevLogIndex: s.getLastLogIndex(),
+			PrevLogTerm:  s.getLastLogTerm(),
 			Entries:      nil,
-			LeaderCommit: s.lastCommitIndex,
+			LeaderCommit: s.getLastCommitIndex(),
 		})
 		if err != nil {
 			slog.Error(err.Error(), slog.String("addr", addr))
@@ -190,6 +272,55 @@ func (s *CoreSm) enterCandidate() error {
 		}
 	}
 	return nil
+}
+
+func (s *CoreSm) execAppendCommandsFromLoop(ctx *context.Context, req *raft.AppendCommandsReq) (*raft.AppendCommandsRsp, error) {
+	const OneMaxCount = 100
+	if !s.myIsLeader() {
+		return nil, fmt.Errorf("my is not leader, addr=%s, state=%d", s.rpc.My, s.state)
+	}
+	entries := make([]*raft.Entry, 0, OneMaxCount)
+	for len(req.Commands) > 0 {
+		count := OneMaxCount
+		if len(req.Commands) < OneMaxCount {
+			count = len(req.Commands)
+		}
+		entries = entries[:0]
+		for idx, cmd := range req.Commands[:count] {
+			entries = append(entries, &raft.Entry{
+				Term:     s.term,
+				LogIndex: s.getLastLogIndex() + uint64(idx),
+				Command:  cmd,
+			})
+		}
+		err := s.logMgr.applyLog(ctx, entries)
+		if err != nil {
+			return nil, err
+		}
+		// 多数提交, 70%, 最少2个节点提交即可返回
+		addr, err := s.rpc.broadcastAppendEntries2AllMemberShip(ctx, &raft.AppendEntriesReq{
+			Term:         s.term,
+			LeaderId:     s.rpc.Leader,
+			PrevLogIndex: s.getLastLogIndex(),
+			PrevLogTerm:  s.getLastLogTerm(),
+			Entries:      entries,
+		})
+		if err != nil {
+			slog.Error(err.Error(), slog.String("addr", addr))
+		}
+	}
+	return &raft.AppendCommandsRsp{
+		LastLogIndex: s.getLastLogIndex(),
+		LastLogTerm:  s.getLastLogTerm(),
+	}, nil
+}
+
+func (s *CoreSm) execGetLeaderFromLoop(ctx *context.Context, req *raft.GetLeaderReq) (rsp *raft.GetLeaderRsp, err error) {
+	rsp = &raft.GetLeaderRsp{
+		LeaderId: s.rpc.Leader,
+		LeaderIp: s.rpc.Leader,
+	}
+	return rsp, nil
 }
 
 func (s *CoreSm) execRequestVoteFromLoop(ctx *context.Context, req *raft.RequestVoteReq) (rsp *raft.RequestVoteRsp, err error) {
@@ -205,7 +336,7 @@ func (s *CoreSm) execRequestVoteFromLoop(ctx *context.Context, req *raft.Request
 	} else if req.Term < s.term {
 		rsp.VoteGranted = false
 		rsp.Term = s.term
-	} else if req.LastLogTerm > s.lastLogTerm || req.LastLogIndex > s.lastLogIndex {
+	} else if req.LastLogTerm > s.getLastLogTerm() || req.LastLogIndex > s.getLastLogIndex() {
 		rsp.VoteGranted = true
 		rsp.Term = s.term
 	}
@@ -216,17 +347,18 @@ func (s *CoreSm) execRequestVoteFromLoop(ctx *context.Context, req *raft.Request
 }
 
 func (s *CoreSm) execLeaderHeartBeatFromLoop(ctx *context.Context, req *raft.AppendEntriesReq) (rsp *raft.AppendEntriesRsp, err error) {
-	slog.Info("leader heartbeat", slog.String("leader", req.LeaderId), slog.String("my", s.rpc.My))
+	slog.Debug("leader heartbeat", slog.String("leader", req.LeaderId), slog.String("my", s.rpc.My))
 	rsp = new(raft.AppendEntriesRsp)
 	if s.term > req.Term {
 		err = errors.New("term is greater than current term")
 		return
 	}
-	if s.lastLogIndex > req.PrevLogIndex {
+	if s.getLastLogIndex() > req.PrevLogIndex {
 		err = errors.New("prev log is greater than current log index")
 		return
 	}
 	s.lastLeaderHeartBeat = time.Now()
+	s.rpc.Leader = req.LeaderId
 	rsp.Term = s.term
 	return rsp, nil
 }
@@ -238,7 +370,7 @@ func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.Appen
 		err = errors.New("term is greater than current term")
 		return
 	}
-	if s.lastLogIndex > req.PrevLogIndex {
+	if s.getLastLogIndex() > req.PrevLogIndex {
 		err = errors.New("prev log is greater than current log index")
 		return
 	}
@@ -251,6 +383,42 @@ func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.Appen
 	}
 	rsp.Term = s.term
 	s.term = maxTermEntry.Term
+	return rsp, nil
+}
+
+func (s *CoreSm) execGetLeader(ctx *context.Context, req *raft.GetLeaderReq) (rsp *raft.GetLeaderRsp, err error) {
+	cq := make(chan smCommandRes, 1)
+	s.q <- smCommand{
+		typ: smCommandGetLeader,
+		ctx: ctx,
+		req: req,
+		cq:  cq,
+	}
+	select {
+	case res := <-cq:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		rsp = res.Rsp.(*raft.GetLeaderRsp)
+	}
+	return rsp, nil
+}
+
+func (s *CoreSm) execAppendCommands(ctx *context.Context, req *raft.AppendCommandsReq) (rsp *raft.AppendCommandsRsp, err error) {
+	cq := make(chan smCommandRes, 1)
+	s.q <- smCommand{
+		typ: smCommandAppendCommands,
+		ctx: ctx,
+		req: req,
+		cq:  cq,
+	}
+	select {
+	case res := <-cq:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		rsp = res.Rsp.(*raft.AppendCommandsRsp)
+	}
 	return rsp, nil
 }
 

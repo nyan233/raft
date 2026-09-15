@@ -3,7 +3,7 @@ package raft
 
 /*
    @Generator   : protoc-gen-go-lrpc
-   @CreateTime  : 2026-09-11 19:07:39.36178 +0800 CST
+   @CreateTime  : 2026-09-15 23:04:47.691873 +0800 CST
    @Author      : NoAuthor
    @Comment     : code is auto generate do not edit
 */
@@ -14,11 +14,11 @@ import (
 )
 
 var (
-	_ callera2c4bfe0da18477ab57295ac6b3eb187 = new(client.Client)
+	_ caller94d6f3c3b6bb4a628a1cbc5b3ce3a3c9 = new(client.Client)
 	_ RaftProxy                              = new(raftImpl)
 )
 
-type callera2c4bfe0da18477ab57295ac6b3eb187 interface {
+type caller94d6f3c3b6bb4a628a1cbc5b3ce3a3c9 interface {
 	Request2(service string, opts []client.CallOption, reqCount int, args ...interface{}) error
 }
 
@@ -26,19 +26,21 @@ type RaftProxy interface {
 	RequestVote(a0 *context.Context, a1 *RequestVoteReq, opts ...client.CallOption) (r0 *RequestVoteRsp, r1 error)
 	AppendEntries(a0 *context.Context, a1 *AppendEntriesReq, opts ...client.CallOption) (r0 *AppendEntriesRsp, r1 error)
 	InstallSnapshot(a0 *context.Context, a1 *InstallSnapshotReq, opts ...client.CallOption) (r0 *InstallSnapshotRsp, r1 error)
+	GetLeader(a0 *context.Context, a1 *GetLeaderReq, opts ...client.CallOption) (r0 *GetLeaderRsp, r1 error)
+	AppendCommands(a0 *context.Context, a1 *AppendCommandsReq, opts ...client.CallOption) (r0 *AppendCommandsRsp, r1 error)
 }
 
 type raftImpl struct {
-	callera2c4bfe0da18477ab57295ac6b3eb187
+	caller94d6f3c3b6bb4a628a1cbc5b3ce3a3c9
 }
 
-func NewRaft(b callera2c4bfe0da18477ab57295ac6b3eb187) RaftProxy {
+func NewRaft(b caller94d6f3c3b6bb4a628a1cbc5b3ce3a3c9) RaftProxy {
 	proxy := new(raftImpl)
-	c, ok := b.(callera2c4bfe0da18477ab57295ac6b3eb187)
+	c, ok := b.(caller94d6f3c3b6bb4a628a1cbc5b3ce3a3c9)
 	if !ok {
 		panic("the argument is not implemented caller")
 	}
-	proxy.callera2c4bfe0da18477ab57295ac6b3eb187 = c
+	proxy.caller94d6f3c3b6bb4a628a1cbc5b3ce3a3c9 = c
 	return proxy
 }
 
@@ -57,5 +59,17 @@ func (p raftImpl) AppendEntries(a0 *context.Context, a1 *AppendEntriesReq, opts 
 func (p raftImpl) InstallSnapshot(a0 *context.Context, a1 *InstallSnapshotReq, opts ...client.CallOption) (r0 *InstallSnapshotRsp, r1 error) {
 	r0 = new(InstallSnapshotRsp)
 	r1 = p.Request2("raft.InstallSnapshot", opts, 2, a0, a1, r0)
+	return
+}
+
+func (p raftImpl) GetLeader(a0 *context.Context, a1 *GetLeaderReq, opts ...client.CallOption) (r0 *GetLeaderRsp, r1 error) {
+	r0 = new(GetLeaderRsp)
+	r1 = p.Request2("raft.GetLeader", opts, 2, a0, a1, r0)
+	return
+}
+
+func (p raftImpl) AppendCommands(a0 *context.Context, a1 *AppendCommandsReq, opts ...client.CallOption) (r0 *AppendCommandsRsp, r1 error) {
+	r0 = new(AppendCommandsRsp)
+	r1 = p.Request2("raft.AppendCommands", opts, 2, a0, a1, r0)
 	return
 }

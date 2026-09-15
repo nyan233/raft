@@ -8,6 +8,7 @@ service raft {
   rpc AppendEntries(AppendEntriesReq) returns (AppendEntriesRsp);
   rpc InstallSnapshot(InstallSnapshotReq) returns (InstallSnapshotRsp);
   rpc GetLeader(GetLeaderReq) returns (GetLeaderRsp);
+  rpc AppendCommands(AppendCommandsReq) returns (AppendCommandsRsp);
 }
 
 
@@ -70,4 +71,13 @@ message GetLeaderReq {
 message GetLeaderRsp {
   string leader_id = 1;
   string leader_ip = 2;
+}
+
+message AppendCommandsReq {
+  repeated bytes commands = 1;
+}
+
+message AppendCommandsRsp {
+  uint64 last_log_index = 1;
+  uint64 last_log_term = 2;
 }

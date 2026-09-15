@@ -13,6 +13,11 @@ import (
 	"github.com/nyan233/raft/pb/message/raft"
 )
 
+type rpcResult[T any] struct {
+	result *T
+	err    error
+}
+
 type coreRpc struct {
 	My         string
 	Membership []string
@@ -25,7 +30,7 @@ type coreRpc struct {
 func newCoreRpc(sm *CoreSm, my string, membership []string) (*coreRpc, error) {
 	c, err := client.New(
 		client.WithCodec("json"),
-		client.WithMuxWriter(),
+		//client.WithMuxWriter(),
 		client.WithNsStorage(ns.NewFixedStorage(membership)),
 	)
 	if err != nil {
@@ -61,6 +66,14 @@ func (c *coreRpc) AppendEntries(ctx *context.Context, req *raft.AppendEntriesReq
 func (c *coreRpc) InstallSnapshot(ctx *context.Context, req *raft.InstallSnapshotReq) (rsp *raft.InstallSnapshotRsp, err error) {
 	//TODO implement me
 	panic("implement me")
+}
+
+func (c *coreRpc) GetLeader(ctx *context.Context, req *raft.GetLeaderReq) (rsp *raft.GetLeaderRsp, err error) {
+	return c.sm.execGetLeader(ctx, req)
+}
+
+func (c *coreRpc) AppendCommands(ctx *context.Context, req *raft.AppendCommandsReq) (rsp *raft.AppendCommandsRsp, err error) {
+	return c.sm.execAppendCommands(ctx, req)
 }
 
 func (c *coreRpc) parallelRequestVote(ctx *context.Context, req *raft.RequestVoteReq) (rsp map[string]*rpcResult[raft.RequestVoteRsp], err error) {
@@ -109,7 +122,7 @@ func (c *coreRpc) parallelRequestVote(ctx *context.Context, req *raft.RequestVot
 	return rsp, nil
 }
 
-func (c *coreRpc) broadcastHeartbeatAllMemberShip(ctx *context.Context, req *raft.AppendEntriesReq) (string, error) {
+func (c *coreRpc) broadcastAppendEntries2AllMemberShip(ctx *context.Context, req *raft.AppendEntriesReq) (string, error) {
 	membershipErrs := make([]error, len(c.Membership))
 	wg := sync.WaitGroup{}
 	wg.Add(len(c.Membership))
@@ -129,6 +142,9 @@ func (c *coreRpc) broadcastHeartbeatAllMemberShip(ctx *context.Context, req *raf
 			_, err := c.proxy.AppendEntries(ctx, req, client.WithAddr(member2))
 			if err != nil {
 				membershipErrs[idx2] = err
+			}
+			if len(req.Entries) > 0 {
+				slog.Info("append entries to membership", slog.String("src", c.My), slog.String("target", member2))
 			}
 		}(idx, member)
 	}

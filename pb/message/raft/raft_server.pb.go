@@ -3,7 +3,7 @@ package raft
 
 /*
    @Generator   : protoc-gen-go-lrpc
-   @CreateTime  : 2026-09-11 19:07:39.362435 +0800 CST
+   @CreateTime  : 2026-09-15 23:04:47.708522 +0800 CST
    @Author      : NoAuthor
    @Comment     : code is auto generate do not edit
 */
@@ -18,6 +18,8 @@ type RaftServer interface {
 	RequestVote(ctx *context.Context, req *RequestVoteReq) (rsp *RequestVoteRsp, err error)
 	AppendEntries(ctx *context.Context, req *AppendEntriesReq) (rsp *AppendEntriesRsp, err error)
 	InstallSnapshot(ctx *context.Context, req *InstallSnapshotReq) (rsp *InstallSnapshotRsp, err error)
+	GetLeader(ctx *context.Context, req *GetLeaderReq) (rsp *GetLeaderRsp, err error)
+	AppendCommands(ctx *context.Context, req *AppendCommandsReq) (rsp *AppendCommandsRsp, err error)
 }
 
 type UnImplRaftServer struct{}
@@ -31,6 +33,14 @@ func (s UnImplRaftServer) AppendEntries(ctx *context.Context, req *AppendEntries
 }
 
 func (s UnImplRaftServer) InstallSnapshot(ctx *context.Context, req *InstallSnapshotReq) (rsp *InstallSnapshotRsp, err error) {
+	panic("not implemented")
+}
+
+func (s UnImplRaftServer) GetLeader(ctx *context.Context, req *GetLeaderReq) (rsp *GetLeaderRsp, err error) {
+	panic("not implemented")
+}
+
+func (s UnImplRaftServer) AppendCommands(ctx *context.Context, req *AppendCommandsReq) (rsp *AppendCommandsRsp, err error) {
 	panic("not implemented")
 }
 
@@ -48,6 +58,14 @@ var RaftServerDesc = server.Desc{
 			},
 			{
 				Name:    "InstallSnapshot",
+				Options: nil,
+			},
+			{
+				Name:    "GetLeader",
+				Options: nil,
+			},
+			{
+				Name:    "AppendCommands",
 				Options: nil,
 			},
 		},

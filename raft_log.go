@@ -1,12 +1,14 @@
 package raft
 
 import (
+	"cmp"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 
@@ -258,11 +260,10 @@ func (mgr *raftLogManager) init() error {
 	if err != nil {
 		return err
 	}
-	if entry == nil {
-		return nil
+	if entry != nil {
+		mgr.lastLogIndex = entry.LogIndex
+		mgr.lastLogTerm = entry.Term
 	}
-	mgr.lastLogIndex = entry.LogIndex
-	mgr.lastLogTerm = entry.Term
 	ctx := context.Background()
 	err = mgr.sm.Init(ctx)
 	if err != nil {
@@ -277,13 +278,20 @@ func (mgr *raftLogManager) init() error {
 }
 
 func (mgr *raftLogManager) applyLog(ctx *context.Context, entries []*raft.Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	// 分批次应用, 单次最多500条
 	const OneMaxCount = 500
 	var (
-		count     int
-		wbEntries = entries
+		count      int
+		wbEntries  = entries
+		numEntries = len(entries)
+		maxTerm    = slices.MaxFunc(entries, func(a, b *raft.Entry) int {
+			return cmp.Compare(a.Term, b.Term)
+		}).Term
 	)
 	for len(wbEntries) > 0 {
 		count = OneMaxCount
@@ -308,5 +316,12 @@ func (mgr *raftLogManager) applyLog(ctx *context.Context, entries []*raft.Entry)
 		}
 		entries = entries[count:]
 	}
+	mgr.lastLogIndex += uint64(numEntries)
+	mgr.lastLogTerm = maxTerm
+	lastCommitIndex, err := mgr.sm.LastCommit(ctx)
+	if err != nil {
+		return err
+	}
+	mgr.lastCommitIndex = lastCommitIndex
 	return nil
 }
