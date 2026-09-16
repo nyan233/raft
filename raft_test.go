@@ -78,8 +78,15 @@ func (t *testUserSm) Apply(ctx *context.Context, entries []*raft.Entry) error {
 }
 
 func (t *testUserSm) Snapshot(ctx *context.Context) ([]*raft.Entry, error) {
-	//TODO implement me
-	panic("implement me")
+	logIndex, val, err := t.Read()
+	if err != nil {
+		return nil, err
+	}
+	entry := &raft.Entry{
+		LogIndex: logIndex,
+		Command:  binary.BigEndian.AppendUint64(nil, val),
+	}
+	return []*raft.Entry{entry}, nil
 }
 
 func (t *testUserSm) ReCall(ctx *context.Context, entries []*raft.Entry) error {
