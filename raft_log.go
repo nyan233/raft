@@ -10,14 +10,17 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/nyan233/littlerpc/core/common/context"
 	"github.com/nyan233/raft/pb/message/raft"
 )
 
 const (
-	logDiskSize = 4 + 8*4 + 4
+	logDiskSize    = 4 + 8*4 + 4
+	logDataMaxSize = 1024 * 1024 * 1024 // 1GB
 )
 
 type logDisk struct {
@@ -64,13 +67,14 @@ func (d *logDisk) parse(buf []byte) error {
 }
 
 type logSet struct {
-	idx *os.File
-	dat *os.File
+	idx        *os.File
+	dat        *os.File
+	onlyAppend bool
 }
 
 func openLogSet(dir string, name string, write bool) (*logSet, error) {
 	var (
-		s    = new(logSet)
+		s    = &logSet{onlyAppend: write}
 		err  error
 		flag int
 	)
@@ -88,6 +92,50 @@ func openLogSet(dir string, name string, write bool) (*logSet, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+func openLogSegFile(dir, name string, segCount int) (*logSet, error) {
+	var (
+		s    = &logSet{onlyAppend: false}
+		err  error
+		flag = os.O_RDONLY
+	)
+	s.idx, err = os.OpenFile(filepath.Join(dir, name+".idx.seg."+strconv.Itoa(segCount)), flag, 0644)
+	if err != nil {
+		return nil, err
+	}
+	s.dat, err = os.OpenFile(filepath.Join(dir, name+".dat.seg."+strconv.Itoa(segCount)), flag, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *logSet) dataSize() (int64, error) {
+	if s.onlyAppend {
+		endOff, err := s.dat.Seek(0, io.SeekEnd)
+		if err != nil {
+			return 0, err
+		}
+		return endOff, nil
+	}
+	fi, err := s.dat.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+func (s *logSet) close() error {
+	err := s.idx.Close()
+	if err != nil {
+		return err
+	}
+	err = s.dat.Close()
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *logSet) closeAndRenameSeg(n int) error {
@@ -236,6 +284,7 @@ type raftLogManager struct {
 	r               *logSet
 	w               *logSet
 	sm              StateMachine
+	maxLogSeg       int
 }
 
 func newRaftLogManager(dirPath string, logName string, sm StateMachine) *raftLogManager {
@@ -264,6 +313,10 @@ func (mgr *raftLogManager) init() error {
 		mgr.lastLogIndex = entry.LogIndex
 		mgr.lastLogTerm = entry.Term
 	}
+	err = mgr.initSeg()
+	if err != nil {
+		return err
+	}
 	ctx := context.Background()
 	err = mgr.sm.Init(ctx)
 	if err != nil {
@@ -274,7 +327,127 @@ func (mgr *raftLogManager) init() error {
 		return err
 	}
 	// TODO 未提交完的数据? logIndex > lastCommitIndex
+	mgr.startBgLogSegClean()
 	return nil
+}
+
+func (mgr *raftLogManager) getSegFileName(segCount int) (string, string) {
+	idx := fmt.Sprintf("%s.idx.seg.%d", mgr.logName, segCount)
+	dat := fmt.Sprintf("%s.dat.seg.%d", mgr.logName, segCount)
+	return idx, dat
+}
+
+func (mgr *raftLogManager) getSegList() ([]int, error) {
+	dirEntry, err := os.ReadDir(mgr.dirPath)
+	if err != nil {
+		return nil, err
+	}
+	subStr := mgr.logName + ".dat.seg."
+	segList := make([]int, 0)
+	for _, entry := range dirEntry {
+		name := entry.Name()
+		if strings.Contains(name, subStr) {
+			segCount, err := strconv.Atoi(name[len(subStr):])
+			if err != nil {
+				return nil, err
+			}
+			segList = append(segList, segCount)
+		}
+	}
+	slices.Sort(segList)
+	return segList, nil
+}
+
+func (mgr *raftLogManager) initSeg() error {
+	segList, err := mgr.getSegList()
+	if err != nil {
+		return err
+	}
+	if len(segList) == 0 {
+		return nil
+	}
+	mgr.maxLogSeg = segList[len(segList)-1]
+	if mgr.lastLogIndex != 0 {
+		return nil
+	}
+	segFs, err := openLogSegFile(mgr.dirPath, mgr.logName, segList[len(segList)-1])
+	if err != nil {
+		return err
+	}
+	entry, err := segFs.last()
+	if err != nil {
+		return err
+	}
+	mgr.lastLogIndex = entry.LogIndex
+	mgr.lastLogTerm = entry.Term
+	return nil
+}
+
+func (mgr *raftLogManager) mergeLogFile() error {
+	err := mgr.r.close()
+	if err != nil {
+		return err
+	}
+	err = mgr.w.closeAndRenameSeg(mgr.maxLogSeg)
+	if err != nil {
+		return err
+	}
+	mgr.maxLogSeg++
+	mgr.w, err = openLogSet(mgr.dirPath, mgr.logName, true)
+	if err != nil {
+		return err
+	}
+	mgr.r, err = openLogSet(mgr.dirPath, mgr.logName, false)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (mgr *raftLogManager) startBgLogSegClean() {
+	go func() {
+		ticker := time.NewTicker(time.Second * 5)
+		for {
+			select {
+			case <-ticker.C:
+				mgr.cleanLogSeg()
+			}
+		}
+	}()
+}
+
+func (mgr *raftLogManager) cleanLogSeg() {
+	defer func() {
+		err := recover()
+		if err != nil {
+			return
+		}
+	}()
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	segList, err := mgr.getSegList()
+	if err != nil {
+		return
+	}
+	entry, err := mgr.r.first()
+	if err != nil {
+		return
+	}
+	if entry == nil {
+		if len(segList) > 1 {
+			for _, segC := range segList[:len(segList)-1] {
+				idxFileName, datFileName := mgr.getSegFileName(segC)
+				os.Remove(filepath.Join(mgr.dirPath, idxFileName))
+				os.Remove(filepath.Join(mgr.dirPath, datFileName))
+			}
+		}
+	} else {
+		for _, segC := range segList {
+			idxFileName, datFileName := mgr.getSegFileName(segC)
+			os.Remove(filepath.Join(mgr.dirPath, idxFileName))
+			os.Remove(filepath.Join(mgr.dirPath, datFileName))
+		}
+	}
 }
 
 func (mgr *raftLogManager) applyLog(ctx *context.Context, entries []*raft.Entry) error {
@@ -296,7 +469,7 @@ func (mgr *raftLogManager) applyLog(ctx *context.Context, entries []*raft.Entry)
 	for len(wbEntries) > 0 {
 		count = OneMaxCount
 		if len(wbEntries) < OneMaxCount {
-			count = len(entries)
+			count = len(wbEntries)
 		}
 		err := mgr.w.write(wbEntries[:count])
 		if err != nil {
@@ -323,5 +496,16 @@ func (mgr *raftLogManager) applyLog(ctx *context.Context, entries []*raft.Entry)
 		return err
 	}
 	mgr.lastCommitIndex = lastCommitIndex
+	logSize, err := mgr.w.dataSize()
+	if err != nil {
+		return err
+	}
+	// 1GB
+	if logSize > logDataMaxSize {
+		err = mgr.mergeLogFile()
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }

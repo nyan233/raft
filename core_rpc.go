@@ -144,7 +144,7 @@ func (c *coreRpc) broadcastAppendEntries2AllMemberShip(ctx *context.Context, req
 				membershipErrs[idx2] = err
 			}
 			if len(req.Entries) > 0 {
-				slog.Info("append entries to membership", slog.String("src", c.My), slog.String("target", member2))
+				slog.Info("append entries to membership", slog.String("src", c.My), slog.String("target", member2), slog.Int("len", len(req.Entries)))
 			}
 		}(idx, member)
 	}

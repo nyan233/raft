@@ -129,16 +129,28 @@ func TestCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf := make([][]byte, 0, 256)
-	for i := 100; i < 500; i++ {
+	for i := 100; i < 200000; i++ {
 		command := make([]byte, 8)
 		binary.BigEndian.PutUint64(command, uint64(i))
 		buf = append(buf, command)
 	}
-	err = raftCli.AppendCommands(context.Background(), buf)
+	const BatchSize = 50
+	for len(buf) > 0 {
+		count := BatchSize
+		if len(buf) < count {
+			count = len(buf)
+		}
+		err = raftCli.AppendCommands(context.Background(), buf[:count])
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf = buf[count:]
+	}
+	sm := newTestSm("node3")
+	err = sm.Init(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	sm := newTestSm("node3")
 	lastCommitIndex, count, err := sm.Read()
 	if err != nil {
 		t.Fatal(err)
