@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"cmp"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -163,7 +162,7 @@ func (s *logSet) closeAndRenameSeg(n int) error {
 func (s *logSet) write(entries []*raft.Entry) error {
 	idxBuf := make([]byte, 0, logDiskSize*len(entries))
 	idxEntries := make([]*logDisk, 0, len(entries))
-	currentSeek, err := s.dat.Seek(0, io.SeekCurrent)
+	endSeek, err := s.dat.Seek(0, io.SeekEnd)
 	if err != nil {
 		return err
 	}
@@ -181,10 +180,10 @@ func (s *logSet) write(entries []*raft.Entry) error {
 			logIndex:     entry.LogIndex,
 			logTerm:      entry.Term,
 			dataCheckSum: crc32.ChecksumIEEE(entry.Command),
-			datOffset:    uint64(currentSeek),
+			datOffset:    uint64(endSeek),
 			dataSize:     uint64(len(entry.Command)),
 		})
-		currentSeek += int64(len(entry.Command))
+		endSeek += int64(len(entry.Command))
 	}
 	err = s.dat.Sync()
 	if err != nil {
@@ -210,20 +209,34 @@ func (s *logSet) write(entries []*raft.Entry) error {
 	return nil
 }
 
-func (s *logSet) first() (*raft.Entry, error) {
-	return s.readOff(0)
+func (s *logSet) len() (int64, error) {
+	fi, err := s.dat.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size() / logDiskSize, nil
 }
 
-func (s *logSet) last() (*raft.Entry, error) {
+func (s *logSet) first(onlyIdx bool) (*raft.Entry, error) {
+	return s.readOff(0, onlyIdx)
+}
+
+func (s *logSet) last(onlyIdx bool) (*raft.Entry, error) {
 	info, err := s.idx.Stat()
 	if err != nil {
 		return nil, err
 	}
-	off := info.Size() / logDiskSize
-	return s.readOff(int(off))
+	if info.Size() == 0 {
+		return nil, nil
+	}
+	if info.Size() < logDiskSize {
+		return nil, fmt.Errorf("data corrupted")
+	}
+	off := (info.Size() / logDiskSize) - 1
+	return s.readOff(int(off), onlyIdx)
 }
 
-func (s *logSet) readOff(idx int) (*raft.Entry, error) {
+func (s *logSet) readOff(idx int, onlyIdx bool) (*raft.Entry, error) {
 	var (
 		off = idx * logDiskSize
 		buf = make([]byte, logDiskSize)
@@ -252,6 +265,13 @@ func (s *logSet) readOff(idx int) (*raft.Entry, error) {
 		err = fmt.Errorf("read idx checksum not equal %d", d.idxCheckSum)
 		return nil, err
 	}
+	if onlyIdx {
+		return &raft.Entry{
+			Term:     d.logTerm,
+			LogIndex: d.logIndex,
+			Command:  nil,
+		}, nil
+	}
 	dataBuf := make([]byte, d.dataSize)
 	readCount, err = s.dat.ReadAt(dataBuf, int64(d.datOffset))
 	if err != nil {
@@ -275,16 +295,15 @@ func (s *logSet) readOff(idx int) (*raft.Entry, error) {
 }
 
 type raftLogManager struct {
-	mu              sync.RWMutex
-	lastLogIndex    uint64
-	lastLogTerm     uint64
-	lastCommitIndex uint64
-	dirPath         string
-	logName         string
-	r               *logSet
-	w               *logSet
-	sm              StateMachine
-	maxLogSeg       int
+	mu           sync.RWMutex
+	lastLogIndex uint64
+	lastLogTerm  uint64
+	dirPath      string
+	logName      string
+	r            *logSet
+	w            *logSet
+	sm           StateMachine
+	maxLogSeg    int
 }
 
 func newRaftLogManager(dirPath string, logName string, sm StateMachine) *raftLogManager {
@@ -305,7 +324,7 @@ func (mgr *raftLogManager) init() error {
 	if err != nil {
 		return err
 	}
-	entry, err := mgr.r.last()
+	entry, err := mgr.r.last(true)
 	if err != nil {
 		return err
 	}
@@ -319,10 +338,6 @@ func (mgr *raftLogManager) init() error {
 	}
 	ctx := context.Background()
 	err = mgr.sm.Init(ctx)
-	if err != nil {
-		return err
-	}
-	mgr.lastCommitIndex, err = mgr.sm.LastCommit(ctx)
 	if err != nil {
 		return err
 	}
@@ -374,7 +389,7 @@ func (mgr *raftLogManager) initSeg() error {
 	if err != nil {
 		return err
 	}
-	entry, err := segFs.last()
+	entry, err := segFs.last(true)
 	if err != nil {
 		return err
 	}
@@ -429,7 +444,7 @@ func (mgr *raftLogManager) cleanLogSeg() {
 	if err != nil {
 		return
 	}
-	entry, err := mgr.r.first()
+	entry, err := mgr.r.first(true)
 	if err != nil {
 		return
 	}
@@ -450,7 +465,23 @@ func (mgr *raftLogManager) cleanLogSeg() {
 	}
 }
 
-func (mgr *raftLogManager) applyLog(ctx *context.Context, entries []*raft.Entry) error {
+func (mgr *raftLogManager) getLastCommitIndex(ctx *context.Context) (uint64, error) {
+	return mgr.sm.LastCommit(ctx)
+}
+
+func (mgr *raftLogManager) getLastLogIndex(ctx *context.Context) uint64 {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	return mgr.lastLogIndex
+}
+
+func (mgr *raftLogManager) getLastLogTerm(ctx *context.Context) uint64 {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	return mgr.lastLogTerm
+}
+
+func (mgr *raftLogManager) appendLog(ctx *context.Context, entries []*raft.Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -462,9 +493,6 @@ func (mgr *raftLogManager) applyLog(ctx *context.Context, entries []*raft.Entry)
 		count      int
 		wbEntries  = entries
 		numEntries = len(entries)
-		maxTerm    = slices.MaxFunc(entries, func(a, b *raft.Entry) int {
-			return cmp.Compare(a.Term, b.Term)
-		}).Term
 	)
 	for len(wbEntries) > 0 {
 		count = OneMaxCount
@@ -477,7 +505,22 @@ func (mgr *raftLogManager) applyLog(ctx *context.Context, entries []*raft.Entry)
 		}
 		wbEntries = wbEntries[count:]
 	}
-	count = 0
+	mgr.lastLogIndex += uint64(numEntries)
+	mgr.lastLogTerm = entries[len(entries)-1].Term
+	return nil
+}
+
+func (mgr *raftLogManager) applyLog2UserSm(ctx *context.Context, entries []*raft.Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	// 分批次应用, 单次最多500条
+	const OneMaxCount = 500
+	var (
+		count = 0
+	)
 	for len(entries) > 0 {
 		count = OneMaxCount
 		if len(entries) < OneMaxCount {
@@ -489,13 +532,6 @@ func (mgr *raftLogManager) applyLog(ctx *context.Context, entries []*raft.Entry)
 		}
 		entries = entries[count:]
 	}
-	mgr.lastLogIndex += uint64(numEntries)
-	mgr.lastLogTerm = maxTerm
-	lastCommitIndex, err := mgr.sm.LastCommit(ctx)
-	if err != nil {
-		return err
-	}
-	mgr.lastCommitIndex = lastCommitIndex
 	logSize, err := mgr.w.dataSize()
 	if err != nil {
 		return err
@@ -503,6 +539,42 @@ func (mgr *raftLogManager) applyLog(ctx *context.Context, entries []*raft.Entry)
 	// 1GB
 	if logSize > logDataMaxSize {
 		err = mgr.mergeLogFile()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (mgr *raftLogManager) flushUnCommitLog2UserSm(ctx *context.Context) error {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	userSmLastCommit, err := mgr.sm.LastCommit(ctx)
+	if err != nil {
+		return err
+	}
+	if mgr.lastLogIndex == userSmLastCommit {
+		return nil
+	}
+	firstEntry, err := mgr.r.first(true)
+	if err != nil {
+		return err
+	}
+	lastEntry, err := mgr.r.last(true)
+	if err != nil {
+		return err
+	}
+	count := int64(lastEntry.LogIndex) - int64(userSmLastCommit)
+	if count < 0 {
+		return nil
+	}
+	startOff := int64(userSmLastCommit - firstEntry.LogIndex)
+	for i := int64(0); i < count; i++ {
+		entry, err := mgr.r.readOff(int(startOff+i), false)
+		if err != nil {
+			return err
+		}
+		err = mgr.sm.Apply(ctx, []*raft.Entry{entry})
 		if err != nil {
 			return err
 		}

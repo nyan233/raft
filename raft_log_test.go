@@ -55,7 +55,7 @@ func TestRaftLog(t *testing.T) {
 		defer wg.Done()
 		var logIdx uint64
 		for {
-			entry, err := r.readOff(int(logIdx))
+			entry, err := r.readOff(int(logIdx), false)
 			if err != nil {
 				panic(err)
 			}
