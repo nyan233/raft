@@ -236,6 +236,47 @@ func (s *logSet) last(onlyIdx bool) (*raft.Entry, error) {
 	return s.readOff(int(off), onlyIdx)
 }
 
+func (s *logSet) batchRead(startOff, count int, onlyIdx bool) ([]*raft.Entry, error) {
+	var (
+		offset      = startOff * logDiskSize
+		buf         = make([]byte, logDiskSize*count)
+		entries     = make([]*raft.Entry, 0, count)
+		logDiskList = make([]*logDisk, 0, count)
+	)
+	readCount, err := s.idx.ReadAt(buf, int64(offset))
+	if err != nil {
+		return nil, err
+	}
+	if err == io.EOF {
+		if readCount > 0 {
+			buf = buf[:readCount]
+		} else {
+			return nil, nil
+		}
+	}
+	for len(buf) > 0 {
+		var d logDisk
+		err = d.parse(buf[:logDiskSize])
+		if err != nil {
+			return nil, err
+		}
+		idxCk := crc32.ChecksumIEEE(buf[4:])
+		if idxCk != d.idxCheckSum {
+			err = fmt.Errorf("read idx checksum not equal %d", d.idxCheckSum)
+			return nil, err
+		}
+		logDiskList = append(logDiskList, &d)
+		entries = append(entries, &raft.Entry{
+			Term:     d.logTerm,
+			LogIndex: d.logIndex,
+		})
+	}
+	if onlyIdx {
+		return entries, nil
+	}
+	return entries, nil
+}
+
 func (s *logSet) readOff(idx int, onlyIdx bool) (*raft.Entry, error) {
 	var (
 		off = idx * logDiskSize
