@@ -161,7 +161,7 @@ func TestCandidate(t *testing.T) {
 }
 
 func TestSmRead(t *testing.T) {
-	sm := newTestSm("node3")
+	sm := newTestSm("node1")
 	err := sm.Init(context.Background())
 	if err != nil {
 		t.Fatal(err)

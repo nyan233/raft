@@ -76,83 +76,81 @@ func (c *coreRpc) AppendCommands(ctx *context.Context, req *raft.AppendCommandsR
 	return c.sm.execAppendCommands(ctx, req)
 }
 
-func (c *coreRpc) parallelRequestVote(ctx *context.Context, req *raft.RequestVoteReq) (rsp map[string]*rpcResult[raft.RequestVoteRsp], err error) {
-	membershipRes := make([]rpcResult[raft.RequestVoteRsp], len(c.Membership))
-	wg := sync.WaitGroup{}
-	wg.Add(len(c.Membership))
-	for idx, member := range c.Membership {
-		go func(idx2 int, member2 string) {
-			defer wg.Done()
-			defer func() {
-				if err := recover(); err != nil {
-					errI, ok := err.(error)
-					if ok {
-						membershipRes[idx] = rpcResult[raft.RequestVoteRsp]{result: nil, err: errI}
-					} else {
-						membershipRes[idx] = rpcResult[raft.RequestVoteRsp]{result: nil, err: fmt.Errorf("%v", err)}
+func (c *coreRpc) asyncRequestVoteAllMember(ctx *context.Context, req *raft.RequestVoteReq, cb func(ctx *context.Context, rsp map[string]*rpcResult[raft.RequestVoteRsp], err error)) {
+	ctx = ctx.Clone()
+	go func() {
+		membershipRes := make([]rpcResult[raft.RequestVoteRsp], len(c.Membership))
+		wg := sync.WaitGroup{}
+		wg.Add(len(c.Membership))
+		for idx, member := range c.Membership {
+			ctx2 := ctx.Clone()
+			go func(ctx *context.Context, idx2 int, member2 string) {
+				defer wg.Done()
+				defer func() {
+					if err := recover(); err != nil {
+						errI, ok := err.(error)
+						if ok {
+							membershipRes[idx] = rpcResult[raft.RequestVoteRsp]{result: nil, err: errI}
+						} else {
+							membershipRes[idx] = rpcResult[raft.RequestVoteRsp]{result: nil, err: fmt.Errorf("%v", err)}
+						}
 					}
+				}()
+				reqJson, err := json.Marshal(req)
+				if err != nil {
+					panic(err)
 				}
-			}()
-			reqJson, err := json.Marshal(req)
-			if err != nil {
-				panic(err)
-			}
-			res, err := c.proxy.RequestVote(ctx, req, client.WithAddr(member2))
-			if err != nil {
-				membershipRes[idx2] = rpcResult[raft.RequestVoteRsp]{result: nil, err: err}
-			} else {
-				membershipRes[idx2] = rpcResult[raft.RequestVoteRsp]{result: res, err: nil}
-			}
-			rspJson, err := json.Marshal(res)
-			if err != nil {
-				panic(err)
-			}
-			slog.Info("callRequestVote",
-				slog.String("src", c.My),
-				slog.String("target", member2),
-				slog.String("req", string(reqJson)),
-				slog.String("rsp", string(rspJson)))
-		}(idx, member)
-	}
-	wg.Wait()
-	rsp = make(map[string]*rpcResult[raft.RequestVoteRsp])
-	for idx := range membershipRes {
-		rsp[c.Membership[idx]] = &membershipRes[idx]
-	}
-	return rsp, nil
+				slog.Info("prev callRequestVote",
+					slog.String("src", c.My),
+					slog.String("target", member2),
+					slog.String("req", string(reqJson)))
+				res, err := c.proxy.RequestVote(ctx, req, client.WithAddr(member2))
+				if err != nil {
+					membershipRes[idx2] = rpcResult[raft.RequestVoteRsp]{result: nil, err: err}
+				} else {
+					membershipRes[idx2] = rpcResult[raft.RequestVoteRsp]{result: res, err: nil}
+				}
+				rspJson, err := json.Marshal(res)
+				if err != nil {
+					panic(err)
+				}
+				slog.Info("callRequestVote rsp",
+					slog.String("src", c.My),
+					slog.String("target", member2),
+					slog.String("rsp", string(rspJson)))
+			}(ctx2, idx, member)
+		}
+		wg.Wait()
+		rsp := make(map[string]*rpcResult[raft.RequestVoteRsp])
+		for idx := range membershipRes {
+			rsp[c.Membership[idx]] = &membershipRes[idx]
+		}
+		cb(ctx, rsp, nil)
+	}()
 }
 
-func (c *coreRpc) broadcastAppendEntries2AllMemberShip(ctx *context.Context, req *raft.AppendEntriesReq) (string, error) {
-	membershipErrs := make([]error, len(c.Membership))
-	wg := sync.WaitGroup{}
-	wg.Add(len(c.Membership))
+func (c *coreRpc) broadcastAppendEntries2AllMemberShip(ctx *context.Context, req *raft.AppendEntriesReq) {
 	for idx, member := range c.Membership {
-		go func(idx2 int, member2 string) {
-			defer wg.Done()
+		ctx2 := ctx.Clone()
+		go func(ctx *context.Context, idx2 int, member2 string) {
 			defer func() {
 				if err := recover(); err != nil {
-					errI, ok := err.(error)
-					if ok {
-						membershipErrs[idx] = errI
-					} else {
-						membershipErrs[idx] = fmt.Errorf("%v", err)
-					}
+					return
 				}
 			}()
+			var errStr string
 			_, err := c.proxy.AppendEntries(ctx, req, client.WithAddr(member2))
 			if err != nil {
-				membershipErrs[idx2] = err
+				errStr = err.Error()
 			}
 			if len(req.Entries) > 0 {
-				slog.Info("append entries to membership", slog.String("src", c.My), slog.String("target", member2), slog.Int("len", len(req.Entries)))
+				slog.Info("append entries to membership",
+					slog.String("src", c.My),
+					slog.String("target", member2),
+					slog.Int("len", len(req.Entries)),
+					slog.String("err", errStr),
+				)
 			}
-		}(idx, member)
+		}(ctx2, idx, member)
 	}
-	wg.Wait()
-	for idx, err := range membershipErrs {
-		if err != nil {
-			return c.Membership[idx], err
-		}
-	}
-	return "", nil
 }

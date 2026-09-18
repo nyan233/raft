@@ -21,6 +21,12 @@ const (
 	smCommandExecHeartBeat
 	smCommandAppendCommands
 	smCommandGetLeader
+	smCommandAsyncRequestVoteComp
+)
+
+const (
+	candidateTicker = "candidateTicker"
+	heartbeatTicker = "heartbeatTicker"
 )
 
 type smCommandRes struct {
@@ -29,10 +35,11 @@ type smCommandRes struct {
 }
 
 type smCommand struct {
-	typ uint8
-	ctx *context.Context
-	req proto.Message
-	cq  chan smCommandRes
+	typ    uint8
+	ctx    *context.Context
+	req    proto.Message
+	anyReq any
+	cq     chan smCommandRes
 }
 
 type CoreSmConfig struct {
@@ -52,6 +59,7 @@ type CoreSm struct {
 	logMgr              *raftLogManager
 	rpc                 *coreRpc
 	md                  *meta
+	tt                  *timeoutTicker
 }
 
 func NewCoreSm(cfg CoreSmConfig) *CoreSm {
@@ -88,43 +96,46 @@ func (s *CoreSm) myIsLeader() bool {
 }
 
 func (s *CoreSm) startTimeoutTicker() {
-	go func() {
-		ticker := time.NewTicker(time.Millisecond * 10)
-		for {
-			select {
-			case <-ticker.C:
-				cmd := smCommand{
-					typ: smCommandExecHeartBeat,
-					ctx: context.Background(),
-					req: nil,
-					cq:  make(chan smCommandRes, 1),
-				}
-				s.q <- cmd
-				select {
-				case <-cmd.cq:
-					break
-				}
+	s.tt = newTimeoutTicker()
+	s.tt.RegisterTicker(tickerTask{
+		Name: heartbeatTicker,
+		Next: func(t time.Duration) time.Duration {
+			return time.Millisecond * 10
+		},
+		Callback: func(t time.Time) {
+			cmd := smCommand{
+				typ: smCommandExecHeartBeat,
+				ctx: context.Background(),
+				req: nil,
+				cq:  make(chan smCommandRes, 1),
 			}
-		}
-	}()
-	go func() {
-		for {
+			s.q <- cmd
 			select {
-			case <-time.After(time.Duration(150+rand.Int63n(150)) * time.Millisecond):
-				cmd := smCommand{
-					typ: smCommandCandidateTimeout,
-					ctx: context.Background(),
-					req: nil,
-					cq:  make(chan smCommandRes, 1),
-				}
-				s.q <- cmd
-				select {
-				case <-cmd.cq:
-					break
-				}
+			case <-cmd.cq:
+				break
 			}
-		}
-	}()
+		},
+	})
+	s.tt.RegisterTicker(tickerTask{
+		Name: candidateTicker,
+		Next: func(t time.Duration) time.Duration {
+			return time.Duration(150+rand.Int63n(151)) * time.Millisecond
+		},
+		Callback: func(t time.Time) {
+			cmd := smCommand{
+				typ: smCommandCandidateTimeout,
+				ctx: context.Background(),
+				req: nil,
+				cq:  make(chan smCommandRes, 1),
+			}
+			s.q <- cmd
+			select {
+			case <-cmd.cq:
+				break
+			}
+		},
+	})
+	s.tt.init()
 }
 
 func (s *CoreSm) startLoop() {
@@ -197,7 +208,7 @@ func (s *CoreSm) startLoop() {
 					}
 				}
 				// TODO 有超时的情况会堵很久, 优化一下
-				addr, err := s.rpc.broadcastAppendEntries2AllMemberShip(cmd.ctx, &raft.AppendEntriesReq{
+				s.rpc.broadcastAppendEntries2AllMemberShip(cmd.ctx, &raft.AppendEntriesReq{
 					Term:         s.md.get().Term,
 					LeaderId:     s.rpc.My,
 					PrevLogIndex: s.logMgr.getLastLogIndex(cmd.ctx),
@@ -205,9 +216,6 @@ func (s *CoreSm) startLoop() {
 					Entries:      nil,
 					LeaderCommit: lastCommitIndex,
 				})
-				if err != nil {
-					slog.Error(err.Error(), slog.String("addr", addr))
-				}
 				cmd.cq <- smCommandRes{
 					Rsp: nil,
 					Err: err,
@@ -224,43 +232,25 @@ func (s *CoreSm) startLoop() {
 					Rsp: rsp,
 					Err: err,
 				}
+			case smCommandAsyncRequestVoteComp:
+				err := s.execCommandAsyncRequestVoteCompFromLoop(cmd.ctx, cmd.anyReq.(map[string]*rpcResult[raft.RequestVoteRsp]))
+				if cmd.cq != nil {
+					cmd.cq <- smCommandRes{
+						Rsp: nil,
+						Err: err,
+					}
+				}
 			}
 		}
 	}
 }
 
-func (s *CoreSm) enterCandidate() error {
-	s.state = raft.State_StateCandidate
-	_, err := s.md.termIncr()
-	if err != nil {
-		return err
+func (s *CoreSm) execCommandAsyncRequestVoteCompFromLoop(ctx *context.Context, pRsp map[string]*rpcResult[raft.RequestVoteRsp]) error {
+	if s.state != raft.State_StateCandidate {
+		return nil
 	}
-	minVote := 3
-	if len(s.rpc.Membership) > 4 {
-		minVote = len(s.rpc.Membership) * 100 / 90
-	}
+	minVote := len(s.rpc.Membership)/2 + 1
 	voteCount := 1
-	ctx := context.Background()
-	lastCommitIndex, err := s.logMgr.getLastCommitIndex(ctx)
-	if err != nil {
-		return err
-	}
-	err = s.md.save(metaData{
-		VoteFor: s.rpc.My,
-		Term:    s.md.get().Term,
-	})
-	if err != nil {
-		return err
-	}
-	pRsp, err := s.rpc.parallelRequestVote(ctx, &raft.RequestVoteReq{
-		Term:         s.md.get().Term,
-		CandiDateId:  s.rpc.My,
-		LastLogIndex: s.logMgr.getLastLogIndex(ctx),
-		LastLogTerm:  s.logMgr.getLastLogTerm(ctx),
-	})
-	if err != nil {
-		return err
-	}
 	for _, iRsp := range pRsp {
 		if iRsp.err != nil {
 			return iRsp.err
@@ -269,10 +259,14 @@ func (s *CoreSm) enterCandidate() error {
 		}
 	}
 	if voteCount >= minVote {
+		lastCommitIndex, err := s.logMgr.getLastCommitIndex(ctx)
+		if err != nil {
+			return err
+		}
 		s.state = raft.State_StateLeader
 		s.rpc.Leader = s.rpc.My
 		slog.Info("my is leader, call broadcastAppendEntries2AllMemberShip", slog.String("my", s.rpc.My))
-		addr, err := s.rpc.broadcastAppendEntries2AllMemberShip(ctx, &raft.AppendEntriesReq{
+		s.rpc.broadcastAppendEntries2AllMemberShip(ctx, &raft.AppendEntriesReq{
 			Term:         s.md.get().Term,
 			LeaderId:     s.rpc.My,
 			PrevLogIndex: s.logMgr.getLastLogIndex(ctx),
@@ -280,11 +274,37 @@ func (s *CoreSm) enterCandidate() error {
 			Entries:      nil,
 			LeaderCommit: lastCommitIndex,
 		})
-		if err != nil {
-			slog.Error(err.Error(), slog.String("addr", addr))
-			return err
-		}
 	}
+	return nil
+}
+
+func (s *CoreSm) enterCandidate() error {
+	s.state = raft.State_StateCandidate
+	_, err := s.md.termIncr()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	err = s.md.save(metaData{
+		VoteFor: s.rpc.My,
+		Term:    s.md.get().Term,
+	})
+	if err != nil {
+		return err
+	}
+	req := &raft.RequestVoteReq{
+		Term:         s.md.get().Term,
+		CandiDateId:  s.rpc.My,
+		LastLogIndex: s.logMgr.getLastLogIndex(ctx),
+		LastLogTerm:  s.logMgr.getLastLogTerm(ctx),
+	}
+	s.rpc.asyncRequestVoteAllMember(ctx, req, func(ctx *context.Context, pRsp map[string]*rpcResult[raft.RequestVoteRsp], err error) {
+		s.q <- smCommand{
+			typ:    smCommandAsyncRequestVoteComp,
+			ctx:    ctx,
+			anyReq: pRsp,
+		}
+	})
 	return nil
 }
 
@@ -314,21 +334,16 @@ func (s *CoreSm) execAppendCommandsFromLoop(ctx *context.Context, req *raft.Appe
 		if err != nil {
 			return nil, err
 		}
-		// 多数提交, 70%, 最少2个节点提交即可返回
-		addr, err := s.rpc.broadcastAppendEntries2AllMemberShip(ctx, &raft.AppendEntriesReq{
+		s.rpc.broadcastAppendEntries2AllMemberShip(ctx, &raft.AppendEntriesReq{
 			Term:         s.md.get().Term,
 			LeaderId:     s.rpc.Leader,
 			PrevLogIndex: s.logMgr.getLastLogIndex(ctx),
 			PrevLogTerm:  s.logMgr.getLastLogTerm(ctx),
 			Entries:      entries,
 		})
+		err = s.logMgr.applyLog2UserSm(ctx, entries)
 		if err != nil {
-			slog.Error(err.Error(), slog.String("addr", addr))
-		} else {
-			err = s.logMgr.applyLog2UserSm(ctx, entries)
-			if err != nil {
-				slog.Error(err.Error(), slog.String("addr", addr), slog.String("logic", "applyLog2UserSm"))
-			}
+			slog.Error(err.Error(), slog.String("logic", "applyLog2UserSm"))
 		}
 	}
 	return &raft.AppendCommandsRsp{
@@ -353,24 +368,24 @@ func (s *CoreSm) execRequestVoteFromLoop(ctx *context.Context, req *raft.Request
 	md := *s.md.get()
 	rsp = &raft.RequestVoteRsp{}
 	if req.Term > md.Term {
-		rsp.Term = md.Term
 		md.Term = req.Term
+		rsp.Term = md.Term
 		rsp.VoteGranted = true
-		md.VoteFor = req.CandiDateId
 	} else if req.Term < md.Term {
 		rsp.VoteGranted = false
 		rsp.Term = md.Term
 	} else if req.LastLogTerm > s.logMgr.getLastLogTerm(ctx) || req.LastLogIndex > s.logMgr.getLastLogIndex(ctx) {
 		rsp.VoteGranted = true
 		rsp.Term = md.Term
-		md.VoteFor = req.CandiDateId
 	}
 	if rsp.VoteGranted {
 		s.state = raft.State_StateFollower
+		md.VoteFor = req.CandiDateId
 		err = s.md.save(md)
 		if err != nil {
 			return rsp, fmt.Errorf("save md failed: %v", err)
 		}
+		s.tt.ResetTicker(candidateTicker)
 	}
 	return
 }
