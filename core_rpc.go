@@ -1,21 +1,40 @@
 package raft
 
 import (
-	"encoding/json"
-	"fmt"
 	"log/slog"
-	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/nyan233/littlerpc/core/client"
 	"github.com/nyan233/littlerpc/core/common/context"
 	"github.com/nyan233/littlerpc/core/middle/ns"
 	"github.com/nyan233/littlerpc/core/server"
 	"github.com/nyan233/raft/pb/message/raft"
+	"google.golang.org/protobuf/proto"
 )
 
-type rpcResult[T any] struct {
-	result *T
-	err    error
+const (
+	coreRpcTaskAppendEntries = iota + 13
+)
+
+type asyncVoteRes struct {
+	ReqCount  int
+	VoteCount uint64
+	IsTimeout bool
+}
+
+type asyncAppendEntriesRes struct {
+	ReqCount     int
+	SuccessCount int
+	MemberErr    map[string]error
+	Req          *raft.AppendEntriesReq
+}
+
+type coreRpcTask struct {
+	Type     int
+	Ctx      *context.Context
+	Req      proto.Message
+	Callback interface{}
 }
 
 type coreRpc struct {
@@ -25,6 +44,7 @@ type coreRpc struct {
 	proxy      raft.RaftProxy
 	rpcServer  *server.Server
 	sm         *CoreSm
+	asyncQ     chan coreRpcTask
 }
 
 func newCoreRpc(sm *CoreSm, my string, membership []string) (*coreRpc, error) {
@@ -76,81 +96,151 @@ func (c *coreRpc) AppendCommands(ctx *context.Context, req *raft.AppendCommandsR
 	return c.sm.execAppendCommands(ctx, req)
 }
 
-func (c *coreRpc) asyncRequestVoteAllMember(ctx *context.Context, req *raft.RequestVoteReq, cb func(ctx *context.Context, rsp map[string]*rpcResult[raft.RequestVoteRsp], err error)) {
-	ctx = ctx.Clone()
+func (c *coreRpc) startAsyncQueueHandler() {
 	go func() {
-		membershipRes := make([]rpcResult[raft.RequestVoteRsp], len(c.Membership))
-		wg := sync.WaitGroup{}
-		wg.Add(len(c.Membership))
-		for idx, member := range c.Membership {
-			ctx2 := ctx.Clone()
-			go func(ctx *context.Context, idx2 int, member2 string) {
-				defer wg.Done()
-				defer func() {
-					if err := recover(); err != nil {
-						errI, ok := err.(error)
-						if ok {
-							membershipRes[idx] = rpcResult[raft.RequestVoteRsp]{result: nil, err: errI}
-						} else {
-							membershipRes[idx] = rpcResult[raft.RequestVoteRsp]{result: nil, err: fmt.Errorf("%v", err)}
-						}
-					}
-				}()
-				reqJson, err := json.Marshal(req)
-				if err != nil {
-					panic(err)
-				}
-				slog.Info("prev callRequestVote",
-					slog.String("src", c.My),
-					slog.String("target", member2),
-					slog.String("req", string(reqJson)))
-				res, err := c.proxy.RequestVote(ctx, req, client.WithAddr(member2))
-				if err != nil {
-					membershipRes[idx2] = rpcResult[raft.RequestVoteRsp]{result: nil, err: err}
-				} else {
-					membershipRes[idx2] = rpcResult[raft.RequestVoteRsp]{result: res, err: nil}
-				}
-				rspJson, err := json.Marshal(res)
-				if err != nil {
-					panic(err)
-				}
-				slog.Info("callRequestVote rsp",
-					slog.String("src", c.My),
-					slog.String("target", member2),
-					slog.String("rsp", string(rspJson)))
-			}(ctx2, idx, member)
+		for task := range c.asyncQ {
+			switch task.Type {
+			case coreRpcTaskAppendEntries:
+				c.handleAppendEntriesTask(task.Ctx, task.Req.(*raft.AppendEntriesReq), task.Callback.(func(ctx *context.Context, res *asyncAppendEntriesRes)))
+			}
 		}
-		wg.Wait()
-		rsp := make(map[string]*rpcResult[raft.RequestVoteRsp])
-		for idx := range membershipRes {
-			rsp[c.Membership[idx]] = &membershipRes[idx]
-		}
-		cb(ctx, rsp, nil)
 	}()
 }
 
-func (c *coreRpc) broadcastAppendEntries2AllMemberShip(ctx *context.Context, req *raft.AppendEntriesReq) {
-	for idx, member := range c.Membership {
-		ctx2 := ctx.Clone()
-		go func(ctx *context.Context, idx2 int, member2 string) {
+func (c *coreRpc) handleAppendEntriesTask(ctx *context.Context, req *raft.AppendEntriesReq, cb func(ctx *context.Context, res *asyncAppendEntriesRes)) {
+	var (
+		minReq    = len(c.Membership)/2 + 1
+		errCount  atomic.Uint64
+		succCount atomic.Uint64
+		memberErr = make(map[string]error)
+	)
+	for _, member := range c.Membership {
+		memberErr[member] = nil
+	}
+	for _, member := range c.Membership {
+		go func(ctx *context.Context, member string) {
 			defer func() {
 				if err := recover(); err != nil {
+					errCount.Add(1)
 					return
 				}
 			}()
 			var errStr string
-			_, err := c.proxy.AppendEntries(ctx, req, client.WithAddr(member2))
+			_, err := c.proxy.AppendEntries(ctx, req, client.WithAddr(member))
 			if err != nil {
+				memberErr[member] = err
 				errStr = err.Error()
+			} else {
+				succCount.Add(1)
 			}
 			if len(req.Entries) > 0 {
 				slog.Info("append entries to membership",
 					slog.String("src", c.My),
-					slog.String("target", member2),
+					slog.String("target", member),
 					slog.Int("len", len(req.Entries)),
 					slog.String("err", errStr),
 				)
 			}
-		}(ctx2, idx, member)
+		}(ctx.Clone(), member)
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(time.Second * 30)
+	defer timeout.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if succCount.Load() >= uint64(minReq) || errCount.Load()+succCount.Load() == uint64(len(c.Membership)) {
+				cb(ctx, &asyncAppendEntriesRes{
+					ReqCount:     int(succCount.Load() + errCount.Load()),
+					SuccessCount: int(succCount.Load()),
+					MemberErr:    memberErr,
+					Req:          req,
+				})
+				return
+			}
+		case <-timeout.C:
+			cb(ctx, &asyncAppendEntriesRes{
+				ReqCount:     int(succCount.Load() + errCount.Load()),
+				SuccessCount: int(succCount.Load()),
+				MemberErr:    memberErr,
+				Req:          req,
+			})
+			return
+		}
+	}
+}
+
+// 请求兄弟节点投票, 遵循多数派规则, 多数节点投票了则认为选举成功, 或者所有节点返回了数据则认为此次任务执行完成
+func (c *coreRpc) asyncRequestVote(ctx *context.Context, req *raft.RequestVoteReq, cb func(ctx *context.Context, res *asyncVoteRes)) {
+	ctx = ctx.Clone()
+	go func(ctx *context.Context) {
+		var (
+			minVote   = len(c.Membership)/2 + 1
+			voteCount atomic.Uint64
+			errCount  atomic.Uint64
+			succCount atomic.Uint64
+		)
+		voteCount.Add(1)
+		for _, member := range c.Membership {
+			ctx2 := ctx.Clone()
+			go func(ctx *context.Context, member string) {
+				defer func() {
+					if r := recover(); r != nil {
+						errCount.Add(1)
+					}
+				}()
+				res, err := c.proxy.RequestVote(ctx, req, client.WithAddr(member))
+				if err != nil {
+					errCount.Add(1)
+					slog.Error("rpc request vote",
+						slog.String("my", c.My),
+						slog.String("member", member),
+						slog.String("err", err.Error()))
+				} else {
+					succCount.Add(1)
+					if res.VoteGranted {
+						voteCount.Add(1)
+					}
+				}
+			}(ctx2, member)
+		}
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		timeout := time.NewTimer(time.Second * 30)
+		defer timeout.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if voteCount.Load() >= uint64(minVote) || errCount.Load()+succCount.Load() == uint64(len(c.Membership)) {
+					cb(ctx, &asyncVoteRes{
+						ReqCount:  int(errCount.Load() + succCount.Load()),
+						VoteCount: voteCount.Load(),
+						IsTimeout: false,
+					})
+					return
+				}
+			case <-timeout.C:
+				cb(ctx, &asyncVoteRes{
+					ReqCount:  int(succCount.Load() + errCount.Load()),
+					VoteCount: voteCount.Load(),
+					IsTimeout: true,
+				})
+				return
+			}
+		}
+	}(ctx)
+}
+
+func (c *coreRpc) asyncAppendEntries(ctx *context.Context, req *raft.AppendEntriesReq, cb func(ctx *context.Context, res *asyncAppendEntriesRes)) {
+	if len(req.Entries) > 0 {
+		c.asyncQ <- coreRpcTask{
+			Type:     coreRpcTaskAppendEntries,
+			Ctx:      ctx.Clone(),
+			Req:      req,
+			Callback: cb,
+		}
+	} else {
+		go c.handleAppendEntriesTask(ctx.Clone(), req, cb)
 	}
 }
