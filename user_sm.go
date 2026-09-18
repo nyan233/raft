@@ -10,5 +10,4 @@ type StateMachine interface {
 	LastCommit(ctx *context.Context) (uint64, error)
 	Apply(ctx *context.Context, entries []*raft.Entry) error
 	Snapshot(ctx *context.Context) ([]*raft.Entry, error)
-	ReCall(ctx *context.Context, entries []*raft.Entry) error
 }

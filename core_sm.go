@@ -386,6 +386,17 @@ func (s *CoreSm) execLeaderHeartBeatFromLoop(ctx *context.Context, req *raft.App
 		err = errors.New("prev log is greater than current log index")
 		return
 	}
+	var lastCommitIndex uint64
+	lastCommitIndex, err = s.logMgr.getLastCommitIndex(ctx)
+	if err != nil {
+		return
+	}
+	if req.LeaderCommit > lastCommitIndex {
+		err = s.logMgr.commitLogWithOff(ctx, lastCommitIndex, req.LeaderCommit)
+		if err != nil {
+			return
+		}
+	}
 	s.lastLeaderHeartBeat = time.Now()
 	s.rpc.Leader = req.LeaderId
 	rsp.Term = s.md.get().Term
@@ -407,10 +418,22 @@ func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.Appen
 	if err != nil {
 		return
 	}
-	err = s.logMgr.applyLog2UserSm(ctx, req.Entries)
+	lastCommit, err := s.logMgr.getLastCommitIndex(ctx)
 	if err != nil {
 		return
 	}
+	// follower与leader的提交进度有差, 提交一部分日志
+	if lastCommit < req.LeaderCommit {
+		err = s.logMgr.commitLogWithOff(ctx, lastCommit, req.LeaderCommit)
+		if err != nil {
+			return
+		}
+	}
+	// NOTE: 不在此刻应用到UserSm, leader通常还未提交, 等待leader发过来的心跳, 根据leader的已提交数据来应用状态机
+	//err = s.logMgr.applyLog2UserSm(ctx, req.Entries)
+	//if err != nil {
+	//	return
+	//}
 	rsp.Term = s.md.get().Term
 	return rsp, nil
 }

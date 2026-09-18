@@ -516,6 +516,10 @@ func (mgr *raftLogManager) applyLog2UserSm(ctx *context.Context, entries []*raft
 	}
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
+	return mgr.doApplyLog2UserSm(ctx, entries)
+}
+
+func (mgr *raftLogManager) doApplyLog2UserSm(ctx *context.Context, entries []*raft.Entry) error {
 	// 分批次应用, 单次最多500条
 	const OneMaxCount = 500
 	var (
@@ -539,6 +543,38 @@ func (mgr *raftLogManager) applyLog2UserSm(ctx *context.Context, entries []*raft
 	// 1GB
 	if logSize > logDataMaxSize {
 		err = mgr.mergeLogFile()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (mgr *raftLogManager) commitLogWithOff(ctx *context.Context, start, end uint64) error {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	if start == end {
+		return nil
+	}
+	entry, err := mgr.r.first(true)
+	if err != nil {
+		return err
+	}
+	if entry == nil {
+		return nil
+	}
+	startOff := start - entry.LogIndex
+	endOff := end - entry.LogIndex
+	// TODO 支持批量, 优化性能
+	for i := startOff; i < endOff; i++ {
+		entry, err = mgr.r.readOff(int(i), false)
+		if err != nil {
+			return err
+		}
+		if entry == nil {
+			return nil
+		}
+		err = mgr.doApplyLog2UserSm(ctx, []*raft.Entry{entry})
 		if err != nil {
 			return err
 		}
