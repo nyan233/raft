@@ -182,10 +182,10 @@ func (s *CoreSm) startLoop() {
 							slog.String("member", fmt.Sprintf("%v", s.rpc.Membership)),
 						)
 					}
-				}
-				cmd.cq <- smCommandRes{
-					Rsp: nil,
-					Err: err,
+					cmd.cq <- smCommandRes{
+						Rsp: nil,
+						Err: err,
+					}
 				}
 			case smCommandLeaderHeartBeat:
 				rsp, err := s.execLeaderHeartBeatFromLoop(cmd.ctx, cmd.req.(*raft.AppendEntriesReq))
@@ -220,10 +220,16 @@ func (s *CoreSm) startLoop() {
 				})
 				cmd.cq <- smCommandRes{
 					Rsp: nil,
-					Err: err,
+					Err: nil,
 				}
 			case smCommandAppendCommands:
-				s.execAppendCommandsFromLoop(cmd.ctx, cmd.req.(*raft.AppendCommandsReq), cmd.cq)
+				err := s.execAppendCommandsFromLoop(cmd.ctx, cmd.req.(*raft.AppendCommandsReq), cmd.cq)
+				if err != nil {
+					cmd.cq <- smCommandRes{
+						Rsp: nil,
+						Err: err,
+					}
+				}
 			case smCommandGetLeader:
 				rsp, err := s.execGetLeaderFromLoop(cmd.ctx, cmd.req.(*raft.GetLeaderReq))
 				cmd.cq <- smCommandRes{
@@ -395,12 +401,12 @@ func (s *CoreSm) execRequestVoteFromLoop(ctx *context.Context, req *raft.Request
 	}
 	if rsp.VoteGranted {
 		s.state = raft.State_StateFollower
+		s.tt.ResetTicker(candidateTicker)
 		md.VoteFor = req.CandiDateId
 		err = s.md.save(md)
 		if err != nil {
 			return rsp, fmt.Errorf("save md failed: %v", err)
 		}
-		s.tt.ResetTicker(candidateTicker)
 	}
 	return
 }
@@ -416,16 +422,30 @@ func (s *CoreSm) execLeaderHeartBeatFromLoop(ctx *context.Context, req *raft.App
 		err = errors.New("prev log is greater than current log index")
 		return
 	}
-	var lastCommitIndex uint64
-	lastCommitIndex, err = s.logMgr.getLastCommitIndex(ctx)
-	if err != nil {
-		return
-	}
-	if req.LeaderCommit > lastCommitIndex {
-		err = s.logMgr.commitLogWithOff(ctx, lastCommitIndex, req.LeaderCommit)
+	if s.state == raft.State_StateFollower {
+		var lastCommitIndex uint64
+		lastCommitIndex, err = s.logMgr.getLastCommitIndex(ctx)
 		if err != nil {
 			return
 		}
+		if req.LeaderCommit > lastCommitIndex {
+			err = s.logMgr.commitLogWithOff(ctx, lastCommitIndex, req.LeaderCommit)
+			if err != nil {
+				return
+			}
+		}
+	}
+	if req.Term > s.md.get().Term {
+		s.state = raft.State_StateFollower
+		err = s.md.save(metaData{
+			VoteFor: "",
+			Term:    req.Term,
+		})
+		if err != nil {
+			return
+		}
+	} else if req.Term == s.md.get().Term {
+		s.state = raft.State_StateFollower
 	}
 	s.lastLeaderHeartBeat = time.Now()
 	s.rpc.Leader = req.LeaderId

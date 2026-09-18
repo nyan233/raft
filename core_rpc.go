@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"encoding/json"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -66,12 +67,14 @@ func newCoreRpc(sm *CoreSm, my string, membership []string) (*coreRpc, error) {
 		Membership: membership,
 		rpcServer:  s,
 		sm:         sm,
+		asyncQ:     make(chan coreRpcTask, 1024),
 	}
 	err = raft.RegisterRaftServer(s, cr, nil)
 	if err != nil {
 		return nil, err
 	}
 	go s.Service()
+	cr.startAsyncQueueHandler()
 	return cr, nil
 }
 
@@ -101,15 +104,19 @@ func (c *coreRpc) startAsyncQueueHandler() {
 		for task := range c.asyncQ {
 			switch task.Type {
 			case coreRpcTaskAppendEntries:
-				c.handleAppendEntriesTask(task.Ctx, task.Req.(*raft.AppendEntriesReq), task.Callback.(func(ctx *context.Context, res *asyncAppendEntriesRes)))
+				c.handleAppendEntriesTask(
+					task.Ctx,
+					task.Req.(*raft.AppendEntriesReq),
+					task.Callback.(func(ctx *context.Context, res *asyncAppendEntriesRes)),
+					len(c.Membership)/2+1,
+				)
 			}
 		}
 	}()
 }
 
-func (c *coreRpc) handleAppendEntriesTask(ctx *context.Context, req *raft.AppendEntriesReq, cb func(ctx *context.Context, res *asyncAppendEntriesRes)) {
+func (c *coreRpc) handleAppendEntriesTask(ctx *context.Context, req *raft.AppendEntriesReq, cb func(ctx *context.Context, res *asyncAppendEntriesRes), minReq int) {
 	var (
-		minReq    = len(c.Membership)/2 + 1
 		errCount  atomic.Uint64
 		succCount atomic.Uint64
 		memberErr = make(map[string]error)
@@ -125,7 +132,7 @@ func (c *coreRpc) handleAppendEntriesTask(ctx *context.Context, req *raft.Append
 					return
 				}
 			}()
-			var errStr string
+			var errStr = "nil"
 			_, err := c.proxy.AppendEntries(ctx, req, client.WithAddr(member))
 			if err != nil {
 				memberErr[member] = err
@@ -133,14 +140,12 @@ func (c *coreRpc) handleAppendEntriesTask(ctx *context.Context, req *raft.Append
 			} else {
 				succCount.Add(1)
 			}
-			if len(req.Entries) > 0 {
-				slog.Info("append entries to membership",
-					slog.String("src", c.My),
-					slog.String("target", member),
-					slog.Int("len", len(req.Entries)),
-					slog.String("err", errStr),
-				)
-			}
+			slog.Debug("append entries to membership",
+				slog.String("src", c.My),
+				slog.String("target", member),
+				slog.Int("len", len(req.Entries)),
+				slog.String("err", errStr),
+			)
 		}(ctx.Clone(), member)
 	}
 	ticker := time.NewTicker(time.Millisecond)
@@ -190,19 +195,27 @@ func (c *coreRpc) asyncRequestVote(ctx *context.Context, req *raft.RequestVoteRe
 						errCount.Add(1)
 					}
 				}()
-				res, err := c.proxy.RequestVote(ctx, req, client.WithAddr(member))
+				rsp, err := c.proxy.RequestVote(ctx, req, client.WithAddr(member))
 				if err != nil {
 					errCount.Add(1)
-					slog.Error("rpc request vote",
-						slog.String("my", c.My),
-						slog.String("member", member),
-						slog.String("err", err.Error()))
 				} else {
 					succCount.Add(1)
-					if res.VoteGranted {
+					if rsp.VoteGranted {
 						voteCount.Add(1)
 					}
 				}
+				var errStr = "nil"
+				if err != nil {
+					errStr = err.Error()
+				}
+				reqBytes, _ := json.Marshal(req)
+				rspBytes, _ := json.Marshal(rsp)
+				slog.Info("rpc request vote",
+					slog.String("my", c.My),
+					slog.String("member", member),
+					slog.String("req", string(reqBytes)),
+					slog.String("rsp", string(rspBytes)),
+					slog.String("err", errStr))
 			}(ctx2, member)
 		}
 		ticker := time.NewTicker(time.Millisecond)
@@ -241,6 +254,6 @@ func (c *coreRpc) asyncAppendEntries(ctx *context.Context, req *raft.AppendEntri
 			Callback: cb,
 		}
 	} else {
-		go c.handleAppendEntriesTask(ctx.Clone(), req, cb)
+		go c.handleAppendEntriesTask(ctx.Clone(), req, cb, 0)
 	}
 }
