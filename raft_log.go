@@ -277,6 +277,16 @@ func (s *logSet) batchRead(startOff, count int, onlyIdx bool) ([]*raft.Entry, er
 	return entries, nil
 }
 
+func (s *logSet) truncate(count int) error {
+	truncateSize := logDiskSize * count
+	fi, err := s.idx.Stat()
+	if err != nil {
+		return err
+	}
+	idxSize := fi.Size()
+	return s.idx.Truncate(idxSize - int64(truncateSize))
+}
+
 func (s *logSet) readOff(idx int, onlyIdx bool) (*raft.Entry, error) {
 	var (
 		off = idx * logDiskSize
