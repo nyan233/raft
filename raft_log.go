@@ -678,20 +678,13 @@ func (mgr *raftLogManager) commitLogWithOff(ctx *context.Context, start, end uin
 		return fmt.Errorf("log index %d is greater than start %d", entry.LogIndex, start)
 	}
 	startOff := start - entry.LogIndex
-	endOff := startOff + (end - start)
-	// TODO 支持批量, 优化性能
-	for i := startOff; i < endOff; i++ {
-		entry, err = mgr.r.readOff(int(i), false)
-		if err != nil {
-			return err
-		}
-		if entry == nil {
-			return nil
-		}
-		err = mgr.doApplyLog2UserSm(ctx, []*raft.Entry{entry})
-		if err != nil {
-			return err
-		}
+	entries, err := mgr.r.batchRead(int(startOff), int(end-start), false)
+	if err != nil {
+		return err
+	}
+	err = mgr.doApplyLog2UserSm(ctx, entries)
+	if err != nil {
+		return err
 	}
 	return nil
 }
