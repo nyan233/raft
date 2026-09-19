@@ -196,4 +196,13 @@ func TestSmRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("lastEntry=%+v", lastEntry)
+	entries, err := ls.batchRead(0, 1800, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1800 {
+		t.Fatalf("len(entries)=%d", len(entries))
+	} else {
+		t.Logf("len(entries)=%d, first=%+v, last=%+v", len(entries), entries[0], entries[len(entries)-1])
+	}
 }

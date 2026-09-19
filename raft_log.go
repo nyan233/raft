@@ -27,7 +27,7 @@ type logDisk struct {
 	logIndex     uint64
 	logTerm      uint64
 	dataSize     uint64
-	datOffset    uint64
+	dataOffset   uint64
 	dataCheckSum uint32
 	readData     []byte
 }
@@ -37,7 +37,7 @@ func (d *logDisk) checkSum(buf *[]byte) {
 	binary.BigEndian.PutUint64(checkSumBuf[:8], d.logIndex)
 	binary.BigEndian.PutUint64(checkSumBuf[8:], d.logTerm)
 	binary.BigEndian.PutUint64(checkSumBuf[16:], d.dataSize)
-	binary.BigEndian.PutUint64(checkSumBuf[24:], d.datOffset)
+	binary.BigEndian.PutUint64(checkSumBuf[24:], d.dataOffset)
 	binary.BigEndian.PutUint32(checkSumBuf[32:], d.dataCheckSum)
 	checkSum := crc32.ChecksumIEEE(checkSumBuf)
 	d.idxCheckSum = checkSum
@@ -48,7 +48,7 @@ func (d *logDisk) writeToBuf(buf *[]byte) {
 	*buf = binary.BigEndian.AppendUint64(*buf, d.logIndex)
 	*buf = binary.BigEndian.AppendUint64(*buf, d.logTerm)
 	*buf = binary.BigEndian.AppendUint64(*buf, d.dataSize)
-	*buf = binary.BigEndian.AppendUint64(*buf, d.datOffset)
+	*buf = binary.BigEndian.AppendUint64(*buf, d.dataOffset)
 	*buf = binary.BigEndian.AppendUint32(*buf, d.dataCheckSum)
 }
 
@@ -60,7 +60,7 @@ func (d *logDisk) parse(buf []byte) error {
 	d.logIndex = binary.BigEndian.Uint64(buf[4:])
 	d.logTerm = binary.BigEndian.Uint64(buf[12:])
 	d.dataSize = binary.BigEndian.Uint64(buf[20:])
-	d.datOffset = binary.BigEndian.Uint64(buf[28:])
+	d.dataOffset = binary.BigEndian.Uint64(buf[28:])
 	d.dataCheckSum = binary.BigEndian.Uint32(buf[36:])
 	return nil
 }
@@ -180,7 +180,7 @@ func (s *logSet) write(entries []*raft.Entry) error {
 			logIndex:     entry.LogIndex,
 			logTerm:      entry.Term,
 			dataCheckSum: crc32.ChecksumIEEE(entry.Command),
-			datOffset:    uint64(endSeek),
+			dataOffset:   uint64(endSeek),
 			dataSize:     uint64(len(entry.Command)),
 		})
 		endSeek += int64(len(entry.Command))
@@ -260,7 +260,7 @@ func (s *logSet) batchRead(startOff, count int, onlyIdx bool) ([]*raft.Entry, er
 		if err != nil {
 			return nil, err
 		}
-		idxCk := crc32.ChecksumIEEE(buf[4:])
+		idxCk := crc32.ChecksumIEEE(buf[4:logDiskSize])
 		if idxCk != d.idxCheckSum {
 			err = fmt.Errorf("read idx checksum not equal %d", d.idxCheckSum)
 			return nil, err
@@ -270,9 +270,69 @@ func (s *logSet) batchRead(startOff, count int, onlyIdx bool) ([]*raft.Entry, er
 			Term:     d.logTerm,
 			LogIndex: d.logIndex,
 		})
+		buf = buf[logDiskSize:]
 	}
 	if onlyIdx {
 		return entries, nil
+	}
+	firstLogDisk := logDiskList[0]
+	if len(entries) == 1 {
+		entry := entries[0]
+		buf = make([]byte, firstLogDisk.dataSize)
+		_, err = s.dat.ReadAt(buf, int64(firstLogDisk.dataOffset))
+		if err != nil {
+			return nil, err
+		}
+		if crc32.ChecksumIEEE(buf) != firstLogDisk.dataCheckSum {
+			err = fmt.Errorf("read dat checksum not equal %d", firstLogDisk.dataCheckSum)
+			return nil, err
+		}
+		entry.Command = buf
+	}
+	batchStart := firstLogDisk.dataOffset
+	batchEnd := firstLogDisk.dataOffset + firstLogDisk.dataSize
+	startParse := 0
+	dataBuf := make([]byte, 0, 1024)
+	batchReadFn := func(currentIndex int) error {
+		dataBufSize := batchEnd - batchStart
+		if uint64(cap(dataBuf)) < dataBufSize {
+			dataBuf = make([]byte, 0, dataBufSize)
+		}
+		dataBuf = dataBuf[:dataBufSize]
+		readCount, err = s.dat.ReadAt(dataBuf, int64(batchStart))
+		if err != nil {
+			return err
+		}
+		for k, v := range logDiskList[startParse : currentIndex+1] {
+			commandData := dataBuf[:v.dataSize]
+			if crc32.ChecksumIEEE(commandData) != v.dataCheckSum {
+				err = fmt.Errorf("read dat checksum not equal %d", v.dataCheckSum)
+				return err
+			}
+			entry := entries[k]
+			entry.Command = append(entry.Command, commandData...)
+			dataBuf = dataBuf[v.dataSize:]
+		}
+		return nil
+	}
+	for i := 1; i < len(logDiskList); i++ {
+		d := logDiskList[i]
+		if d.dataOffset == batchEnd {
+			batchEnd += d.dataSize
+		} else {
+			if err = batchReadFn(i); err != nil {
+				return nil, err
+			}
+			batchStart = d.dataOffset
+			batchEnd = d.dataOffset + d.dataSize
+			startParse = i
+		}
+		// 兜一下底
+		if startParse == len(logDiskList)-1 || i == len(logDiskList)-1 {
+			if err = batchReadFn(i); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return entries, nil
 }
@@ -324,7 +384,7 @@ func (s *logSet) readOff(idx int, onlyIdx bool) (*raft.Entry, error) {
 		}, nil
 	}
 	dataBuf := make([]byte, d.dataSize)
-	readCount, err = s.dat.ReadAt(dataBuf, int64(d.datOffset))
+	readCount, err = s.dat.ReadAt(dataBuf, int64(d.dataOffset))
 	if err != nil {
 		return nil, err
 	}
