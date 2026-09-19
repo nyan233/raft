@@ -334,14 +334,13 @@ func (s *CoreSm) execAppendCommandsFromLoop(ctx *context.Context, req *raft.Appe
 	if !s.myIsLeader() {
 		return fmt.Errorf("my is not leader, addr=%s, state=%d", s.rpc.My, s.state)
 	}
-	entries := make([]*raft.Entry, 0, OneMaxCount)
 	commands := req.Commands
 	for len(commands) > 0 {
 		count := OneMaxCount
 		if len(commands) < OneMaxCount {
 			count = len(commands)
 		}
-		entries = entries[:0]
+		entries := make([]*raft.Entry, 0, count)
 		lastLogIndex := s.logMgr.getLastLogIndex(ctx)
 		for idx, cmd := range commands[:count] {
 			entries = append(entries, &raft.Entry{

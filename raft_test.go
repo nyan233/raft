@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"testing"
@@ -136,17 +137,21 @@ func TestCandidate(t *testing.T) {
 		binary.BigEndian.PutUint64(command, uint64(i))
 		buf = append(buf, command)
 	}
-	const BatchSize = 50
+	const (
+		BatchSizeMax = 200
+		BatchSizeMin = 100
+	)
 	for len(buf) > 0 {
-		count := BatchSize
-		if len(buf) < count {
-			count = len(buf)
+		count := BatchSizeMin + rand.Int64N(BatchSizeMax-BatchSizeMin)
+		if int64(len(buf)) < count {
+			count = int64(len(buf))
 		}
 		err = raftCli.AppendCommands(context.Background(), buf[:count])
 		if err != nil {
 			t.Fatal(err)
 		}
 		buf = buf[count:]
+		time.Sleep(time.Millisecond * time.Duration(rand.Int64N(10)))
 	}
 	sm := newTestSm("node3")
 	err = sm.Init(context.Background())
@@ -161,7 +166,8 @@ func TestCandidate(t *testing.T) {
 }
 
 func TestSmRead(t *testing.T) {
-	sm := newTestSm("node1")
+	const NodeName = "node2"
+	sm := newTestSm(NodeName)
 	err := sm.Init(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -171,4 +177,23 @@ func TestSmRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("lastCommitIndex=%d, count=%d", lastCommitIndex, count)
+	ls, err := openLogSet("test", NodeName, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEntry, err := ls.first(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("firstEntry=%+v", firstEntry)
+	nextEntry, err := ls.readOff(1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("nextEntry=%+v", nextEntry)
+	lastEntry, err := ls.last(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("lastEntry=%+v", lastEntry)
 }

@@ -19,7 +19,7 @@ import (
 
 const (
 	logDiskSize    = 4 + 8*4 + 4
-	logDataMaxSize = 1024 * 1024 * 1024 // 1GB
+	logDataMaxSize = 1024 * 1024 // 1GB
 )
 
 type logDisk struct {
@@ -604,8 +604,11 @@ func (mgr *raftLogManager) commitLogWithOff(ctx *context.Context, start, end uin
 	if entry == nil {
 		return nil
 	}
+	if entry.LogIndex > start {
+		return fmt.Errorf("log index %d is greater than start %d", entry.LogIndex, start)
+	}
 	startOff := start - entry.LogIndex
-	endOff := end - entry.LogIndex
+	endOff := startOff + (end - start)
 	// TODO 支持批量, 优化性能
 	for i := startOff; i < endOff; i++ {
 		entry, err = mgr.r.readOff(int(i), false)

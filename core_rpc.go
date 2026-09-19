@@ -116,13 +116,27 @@ func (c *coreRpc) startAsyncQueueHandler() {
 }
 
 func (c *coreRpc) handleAppendEntriesTask(ctx *context.Context, req *raft.AppendEntriesReq, cb func(ctx *context.Context, res *asyncAppendEntriesRes), minReq int) {
+	type rpcResult struct {
+		Rsp *raft.AppendEntriesRsp
+		Err error
+	}
 	var (
-		errCount  atomic.Uint64
-		succCount atomic.Uint64
-		memberErr = make(map[string]error)
+		errCount       atomic.Uint64
+		succCount      atomic.Uint64
+		memberRsp      = make(map[string]*rpcResult)
+		getMemberErrFn = func() map[string]error {
+			memberErr := make(map[string]error)
+			for k, v := range memberRsp {
+				memberErr[k] = v.Err
+			}
+			return memberErr
+		}
 	)
 	for _, member := range c.Membership {
-		memberErr[member] = nil
+		memberRsp[member] = &rpcResult{
+			Rsp: nil,
+			Err: nil,
+		}
 	}
 	for _, member := range c.Membership {
 		go func(ctx *context.Context, member string) {
@@ -133,19 +147,22 @@ func (c *coreRpc) handleAppendEntriesTask(ctx *context.Context, req *raft.Append
 				}
 			}()
 			var errStr = "nil"
-			_, err := c.proxy.AppendEntries(ctx, req, client.WithAddr(member))
+			rsp, err := c.proxy.AppendEntries(ctx, req, client.WithAddr(member))
 			if err != nil {
-				memberErr[member] = err
+				memberRsp[member].Err = err
 				errStr = err.Error()
 			} else {
+				memberRsp[member].Rsp = rsp
 				succCount.Add(1)
 			}
-			slog.Debug("append entries to membership",
-				slog.String("src", c.My),
-				slog.String("target", member),
-				slog.Int("len", len(req.Entries)),
-				slog.String("err", errStr),
-			)
+			if err != nil {
+				slog.Info("append entries to membership",
+					slog.String("src", c.My),
+					slog.String("target", member),
+					slog.Int("len", len(req.Entries)),
+					slog.String("err", errStr),
+				)
+			}
 		}(ctx.Clone(), member)
 	}
 	ticker := time.NewTicker(time.Millisecond)
@@ -159,7 +176,7 @@ func (c *coreRpc) handleAppendEntriesTask(ctx *context.Context, req *raft.Append
 				cb(ctx, &asyncAppendEntriesRes{
 					ReqCount:     int(succCount.Load() + errCount.Load()),
 					SuccessCount: int(succCount.Load()),
-					MemberErr:    memberErr,
+					MemberErr:    getMemberErrFn(),
 					Req:          req,
 				})
 				return
@@ -168,7 +185,7 @@ func (c *coreRpc) handleAppendEntriesTask(ctx *context.Context, req *raft.Append
 			cb(ctx, &asyncAppendEntriesRes{
 				ReqCount:     int(succCount.Load() + errCount.Load()),
 				SuccessCount: int(succCount.Load()),
-				MemberErr:    memberErr,
+				MemberErr:    getMemberErrFn(),
 				Req:          req,
 			})
 			return
