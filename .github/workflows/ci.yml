@@ -16,7 +16,7 @@ jobs:
   test:
     name: Go (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -50,7 +50,9 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
+      - name: Test with race detector
+        env:
+          CGO_ENABLED: '1'
         run: |
           mkdir -p test
-          go test -count=1 -timeout=5m ./...
+          go test -race -count=1 -timeout=10m ./...
