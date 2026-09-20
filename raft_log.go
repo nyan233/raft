@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"cmp"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -159,6 +160,28 @@ func (s *logSet) closeAndRenameSeg(n int) error {
 	return nil
 }
 
+func (s *logSet) Remove() error {
+	idxName := s.idx.Name()
+	datName := s.dat.Name()
+	err := s.idx.Close()
+	if err != nil {
+		return err
+	}
+	err = s.dat.Close()
+	if err != nil {
+		return err
+	}
+	err = os.Remove(idxName)
+	if err != nil {
+		return err
+	}
+	err = os.Remove(datName)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s *logSet) write(entries []*raft.Entry) error {
 	idxBuf := make([]byte, 0, logDiskSize*len(entries))
 	idxEntries := make([]*logDisk, 0, len(entries))
@@ -210,7 +233,7 @@ func (s *logSet) write(entries []*raft.Entry) error {
 }
 
 func (s *logSet) len() (int64, error) {
-	fi, err := s.dat.Stat()
+	fi, err := s.idx.Stat()
 	if err != nil {
 		return 0, err
 	}
@@ -405,6 +428,122 @@ func (s *logSet) readOff(idx int, onlyIdx bool) (*raft.Entry, error) {
 	return e, nil
 }
 
+type logScope struct {
+	m        *raftLogManager
+	startOff uint64
+	count    uint64
+	fs       []*logSet
+}
+
+func newLogScope(m *raftLogManager, startIndex, endIndex uint64) (ls *logScope, err error) {
+	ls = &logScope{
+		m: m,
+	}
+	firstEntry, err := ls.m.r.first(true)
+	if err != nil {
+		return nil, err
+	}
+	lastEntry, err := ls.m.r.last(true)
+	if err != nil {
+		return nil, err
+	}
+	if firstEntry == nil {
+		// 数据可能在seg中, 主文件没有数据
+	} else if firstEntry.LogIndex <= startIndex && lastEntry.LogIndex >= startIndex {
+		// 数据没有在seg中, 在主文件中
+		ls.fs = append(ls.fs, ls.m.r)
+		ls.startOff = startIndex - firstEntry.LogIndex
+		ls.count = (endIndex - startIndex) + 1
+		return ls, nil
+	} else if firstEntry.LogIndex <= endIndex && lastEntry.LogIndex >= startIndex {
+		// 日志的一部分在主文件中
+		ls.fs = append(ls.fs, ls.m.r)
+	}
+	// 数据在seg文件中
+	descSegList, err := ls.m.getSegList(true)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < len(descSegList); i++ {
+		var (
+			seg           = descSegList[i]
+			segFile       *logSet
+			segFirstEntry *raft.Entry
+			segLastEntry  *raft.Entry
+		)
+		segFile, err = openLogSegFile(m.dirPath, m.logName, seg)
+		if err != nil {
+			return nil, err
+		}
+		segFirstEntry, err = segFile.first(true)
+		if err != nil {
+			return nil, err
+		}
+		segLastEntry, err = segFile.last(true)
+		if err != nil {
+			return nil, err
+		}
+		if segFirstEntry.LogIndex <= endIndex && segLastEntry.LogIndex >= startIndex {
+			ls.fs = append(ls.fs, segFile)
+		}
+		if segFirstEntry.LogIndex <= startIndex && segLastEntry.LogIndex >= startIndex {
+			ls.startOff = startIndex - segFirstEntry.LogIndex
+			ls.count = (endIndex - startIndex) + 1
+			break
+		}
+	}
+	if ls.startOff == 0 && ls.count == 0 {
+		return nil, fmt.Errorf("unknown file offset, startIndex=%d, endIndex=%d", startIndex, endIndex)
+	}
+	return ls, nil
+}
+
+func (ls *logScope) close() error {
+	// 不关闭主文件
+	fs := ls.fs
+	if len(fs) == 0 {
+		return nil
+	}
+	for _, v := range fs {
+		if v != ls.m.r {
+			err := v.close()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (ls *logScope) rangeFor(fn func(f *logSet, startOff, count uint64) error) error {
+	fscopy := ls.fs
+	startOff := int64(ls.startOff)
+	maxReadCount := int64(ls.count)
+	for i := len(fscopy) - 1; i >= 0; i-- {
+		if maxReadCount == 0 {
+			break
+		}
+		f := fscopy[i]
+		itemCount, err := f.len()
+		if err != nil {
+			return err
+		}
+		readCount := itemCount
+		if itemCount-startOff < maxReadCount {
+			readCount -= startOff
+		} else {
+			readCount = maxReadCount
+		}
+		err = fn(f, uint64(startOff), uint64(readCount))
+		if err != nil {
+			return err
+		}
+		startOff = 0
+		maxReadCount -= readCount
+	}
+	return nil
+}
+
 type raftLogManager struct {
 	mu           sync.RWMutex
 	lastLogIndex uint64
@@ -463,7 +602,7 @@ func (mgr *raftLogManager) getSegFileName(segCount int) (string, string) {
 	return idx, dat
 }
 
-func (mgr *raftLogManager) getSegList() ([]int, error) {
+func (mgr *raftLogManager) getSegList(isDesc bool) ([]int, error) {
 	dirEntry, err := os.ReadDir(mgr.dirPath)
 	if err != nil {
 		return nil, err
@@ -480,12 +619,18 @@ func (mgr *raftLogManager) getSegList() ([]int, error) {
 			segList = append(segList, segCount)
 		}
 	}
-	slices.Sort(segList)
+	if isDesc {
+		slices.SortFunc(segList, func(a, b int) int {
+			return cmp.Compare(b, a)
+		})
+	} else {
+		slices.Sort(segList)
+	}
 	return segList, nil
 }
 
 func (mgr *raftLogManager) initSeg() error {
-	segList, err := mgr.getSegList()
+	segList, err := mgr.getSegList(false)
 	if err != nil {
 		return err
 	}
@@ -542,6 +687,7 @@ func (mgr *raftLogManager) startBgLogSegClean() {
 	}()
 }
 
+// 清理lastCommit >= .seg.logIndex的文件, 未提交完的不清理
 func (mgr *raftLogManager) cleanLogSeg() {
 	defer func() {
 		err := recover()
@@ -549,34 +695,56 @@ func (mgr *raftLogManager) cleanLogSeg() {
 			return
 		}
 	}()
-	mgr.mu.RLock()
-	defer mgr.mu.RUnlock()
-	segList, err := mgr.getSegList()
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	segList, err := mgr.getSegList(false)
 	if err != nil {
 		return
 	}
-	entry, err := mgr.r.first(true)
+	lastCommit, err := mgr.sm.LastCommit(context.Background())
 	if err != nil {
 		return
 	}
-	if entry == nil {
-		if len(segList) > 1 {
-			for _, segC := range segList[:len(segList)-1] {
-				idxFileName, datFileName := mgr.getSegFileName(segC)
-				os.Remove(filepath.Join(mgr.dirPath, idxFileName))
-				os.Remove(filepath.Join(mgr.dirPath, datFileName))
-			}
+	//entry, err := mgr.r.first(true)
+	//if err != nil {
+	//	return
+	//}
+	//if entry == nil {
+	//	if len(segList) > 1 {
+	//		for _, segC := range segList[:len(segList)-1] {
+	//			idxFileName, datFileName := mgr.getSegFileName(segC)
+	//			os.Remove(filepath.Join(mgr.dirPath, idxFileName))
+	//			os.Remove(filepath.Join(mgr.dirPath, datFileName))
+	//		}
+	//	}
+	//} else {
+	//	for _, segC := range segList {
+	//		idxFileName, datFileName := mgr.getSegFileName(segC)
+	//		os.Remove(filepath.Join(mgr.dirPath, idxFileName))
+	//		os.Remove(filepath.Join(mgr.dirPath, datFileName))
+	//	}
+	//}
+	for _, seg := range segList {
+		segFile, err := openLogSegFile(mgr.dirPath, mgr.logName, seg)
+		if err != nil {
+			return
 		}
-	} else {
-		for _, segC := range segList {
-			idxFileName, datFileName := mgr.getSegFileName(segC)
-			os.Remove(filepath.Join(mgr.dirPath, idxFileName))
-			os.Remove(filepath.Join(mgr.dirPath, datFileName))
+		lastEntry, err := segFile.last(true)
+		if err != nil {
+			return
+		}
+		if lastEntry.LogIndex <= lastCommit {
+			err = segFile.Remove()
+			if err != nil {
+				return
+			}
 		}
 	}
 }
 
 func (mgr *raftLogManager) getLastCommitIndex(ctx *context.Context) (uint64, error) {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
 	return mgr.sm.LastCommit(ctx)
 }
 
@@ -679,6 +847,36 @@ func (mgr *raftLogManager) commitLogWithOff(ctx *context.Context, start, end uin
 	}
 	startOff := start - entry.LogIndex
 	entries, err := mgr.r.batchRead(int(startOff), int(end-start), false)
+	if err != nil {
+		return err
+	}
+	err = mgr.doApplyLog2UserSm(ctx, entries)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (mgr *raftLogManager) commitLogWithOffV2(ctx *context.Context, start, end uint64) error {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	scope, err := newLogScope(mgr, start, end)
+	if err != nil {
+		return err
+	}
+	entries := make([]*raft.Entry, 0, 128)
+	err = scope.rangeFor(func(f *logSet, startOff, count uint64) error {
+		readEntries, err := f.batchRead(int(startOff), int(count), false)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, readEntries...)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	err = scope.close()
 	if err != nil {
 		return err
 	}

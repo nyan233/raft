@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/nyan233/littlerpc/core/common/context"
 	"github.com/nyan233/raft/pb/message/raft"
 )
 
@@ -75,4 +76,29 @@ func TestRaftLog(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+type nilSm struct {
+	lastCommitIndex uint64
+}
+
+func (n *nilSm) Init(ctx *context.Context) error {
+	return nil
+}
+
+func (n *nilSm) LastCommit(ctx *context.Context) (uint64, error) {
+	return n.lastCommitIndex, nil
+}
+
+func (n *nilSm) Apply(ctx *context.Context, entries []*raft.Entry) error {
+	n.lastCommitIndex = entries[len(entries)-1].LogIndex
+	return nil
+}
+
+func (n *nilSm) Snapshot(ctx *context.Context) ([]*raft.Entry, error) {
+	return nil, nil
+}
+
+func TestLogScope(t *testing.T) {
+
 }

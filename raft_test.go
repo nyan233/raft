@@ -132,7 +132,7 @@ func TestCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf := make([][]byte, 0, 256)
-	for i := 100; i < 2000; i++ {
+	for i := 100; i < 2000000; i++ {
 		command := make([]byte, 8)
 		binary.BigEndian.PutUint64(command, uint64(i))
 		buf = append(buf, command)

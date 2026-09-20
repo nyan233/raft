@@ -432,7 +432,7 @@ func (s *CoreSm) execLeaderHeartBeatFromLoop(ctx *context.Context, req *raft.App
 			if req.LeaderCommit-lastCommitIndex < 50 {
 				commitEnd = req.LeaderCommit
 			}
-			err = s.logMgr.commitLogWithOff(ctx, lastCommitIndex, commitEnd)
+			err = s.logMgr.commitLogWithOffV2(ctx, lastCommitIndex+1, commitEnd)
 			if err != nil {
 				return
 			}
