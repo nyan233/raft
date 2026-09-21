@@ -428,85 +428,137 @@ func (s *logSet) readOff(idx int, onlyIdx bool) (*raft.Entry, error) {
 	return e, nil
 }
 
-type logScope struct {
-	m        *raftLogManager
-	startOff uint64
-	count    uint64
-	fs       []*logSet
+type logScope3 struct {
+	m          *raftLogManager
+	startIndex uint64
+	endIndex   uint64
+	fileOff    []logScopeFileOff
 }
 
-func newLogScope(m *raftLogManager, startIndex, endIndex uint64) (ls *logScope, err error) {
-	ls = &logScope{
-		m: m,
+func newLogScope3(m *raftLogManager, startIndex, endIndex uint64) *logScope3 {
+	return &logScope3{
+		m:          m,
+		startIndex: startIndex,
+		endIndex:   endIndex,
+		fileOff:    make([]logScopeFileOff, 0, 8),
 	}
-	firstEntry, err := ls.m.r.first(true)
+}
+
+func (s *logScope3) findStart() (foundStart bool, err error) {
+	firstEntry, err := s.m.r.first(true)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	lastEntry, err := ls.m.r.last(true)
+	lastEntry, err := s.m.r.last(false)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	if firstEntry == nil {
-		// 数据可能在seg中, 主文件没有数据
-	} else if firstEntry.LogIndex <= startIndex && lastEntry.LogIndex >= startIndex {
-		// 数据没有在seg中, 在主文件中
-		ls.fs = append(ls.fs, ls.m.r)
-		ls.startOff = startIndex - firstEntry.LogIndex
-		ls.count = (endIndex - startIndex) + 1
-		return ls, nil
-	} else if firstEntry.LogIndex <= endIndex && lastEntry.LogIndex >= startIndex {
-		// 日志的一部分在主文件中
-		ls.fs = append(ls.fs, ls.m.r)
+	appendFileOff := func(ls *logSet, first, last *raft.Entry) (foundStart bool) {
+		fileOff := logScopeFileOff{
+			ls:       ls,
+			startOff: 0,
+			endOff:   lastEntry.LogIndex - firstEntry.LogIndex,
+			first:    first,
+			last:     last,
+		}
+		if fileOff.inRegion(s.startIndex) {
+			fileOff.startOff = s.startIndex - firstEntry.LogIndex
+			s.fileOff = append(s.fileOff, fileOff)
+			return true
+		}
+		s.fileOff = append(s.fileOff, fileOff)
+		return false
 	}
-	// 数据在seg文件中
-	descSegList, err := ls.m.getSegList(true)
+	if firstEntry != nil {
+		if foundStart = appendFileOff(s.m.r, firstEntry, lastEntry); foundStart {
+			return
+		}
+	}
+	segList, err := s.m.getSegList(true)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	for i := 0; i < len(descSegList); i++ {
-		var (
-			seg           = descSegList[i]
-			segFile       *logSet
-			segFirstEntry *raft.Entry
-			segLastEntry  *raft.Entry
-		)
-		segFile, err = openLogSegFile(m.dirPath, m.logName, seg)
+	for _, seg := range segList {
+		ls, err := openLogSegFile(s.m.dirPath, s.m.logName, seg)
 		if err != nil {
-			return nil, err
+			return false, err
 		}
-		segFirstEntry, err = segFile.first(true)
+		firstEntry, err = ls.first(false)
 		if err != nil {
-			return nil, err
+			return false, err
 		}
-		segLastEntry, err = segFile.last(true)
+		lastEntry, err = ls.last(false)
 		if err != nil {
-			return nil, err
+			return false, err
 		}
-		if segFirstEntry.LogIndex <= endIndex && segLastEntry.LogIndex >= startIndex {
-			ls.fs = append(ls.fs, segFile)
+		if appendFileOff(ls, firstEntry, lastEntry) {
+			return true, nil
 		}
-		if segFirstEntry.LogIndex <= startIndex && segLastEntry.LogIndex >= startIndex {
-			ls.startOff = startIndex - segFirstEntry.LogIndex
-			ls.count = (endIndex - startIndex) + 1
+	}
+	return false, nil
+}
+
+func (s *logScope3) findEnd() error {
+	trimCount := 0
+	for i := 0; i < len(s.fileOff); i++ {
+		fileOff := s.fileOff[i]
+		if fileOff.inRegion(s.endIndex) {
 			break
+		} else {
+			// 超过当前文件的有的索引范围
+			if i == 0 && s.endIndex > fileOff.last.LogIndex {
+				return fmt.Errorf("end index is out of range, end index is %d, last index is %d", s.endIndex, fileOff.last.LogIndex)
+			}
+			trimCount++
+			if fileOff.ls != s.m.r {
+				err := fileOff.ls.close()
+				if err != nil {
+					return err
+				}
+			}
 		}
 	}
-	if ls.startOff == 0 && ls.count == 0 {
-		return nil, fmt.Errorf("unknown file offset, startIndex=%d, endIndex=%d", startIndex, endIndex)
-	}
-	return ls, nil
+	s.fileOff = s.fileOff[trimCount:]
+	s.fileOff[0].endOff = s.endIndex - s.fileOff[0].first.LogIndex
+	return nil
 }
 
-func (ls *logScope) close() error {
-	// 不关闭主文件
-	fs := ls.fs
-	if len(fs) == 0 {
-		return nil
+func (s *logScope3) find() error {
+	if s.startIndex > s.endIndex {
+		return fmt.Errorf("start index is out of range, end index is %d", s.endIndex)
 	}
-	for _, v := range fs {
-		if v != ls.m.r {
-			err := v.close()
+	foundStart, err := s.findStart()
+	if err != nil {
+		s.close()
+		return err
+	}
+	if !foundStart {
+		s.close()
+		return fmt.Errorf("unknown file offset, startIndex=%d, endIndex=%d", s.startIndex, s.endIndex)
+	}
+	err = s.findEnd()
+	if err != nil {
+		s.close()
+		return err
+	}
+	return nil
+}
+
+func (s *logScope3) rangeFor(fn func(f *logSet, startOff, count uint64) error) error {
+	for i := len(s.fileOff) - 1; i >= 0; i-- {
+		ff := s.fileOff[i]
+		err := fn(ff.ls, ff.startOff, (ff.endOff-ff.startOff)+1)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *logScope3) close() error {
+	for _, f := range s.fileOff {
+		if f.ls != s.m.r {
+			err := f.ls.close()
 			if err != nil {
 				return err
 			}
@@ -515,33 +567,16 @@ func (ls *logScope) close() error {
 	return nil
 }
 
-func (ls *logScope) rangeFor(fn func(f *logSet, startOff, count uint64) error) error {
-	fscopy := ls.fs
-	startOff := int64(ls.startOff)
-	maxReadCount := int64(ls.count)
-	for i := len(fscopy) - 1; i >= 0; i-- {
-		if maxReadCount == 0 {
-			break
-		}
-		f := fscopy[i]
-		itemCount, err := f.len()
-		if err != nil {
-			return err
-		}
-		readCount := itemCount
-		if itemCount-startOff < maxReadCount {
-			readCount -= startOff
-		} else {
-			readCount = maxReadCount
-		}
-		err = fn(f, uint64(startOff), uint64(readCount))
-		if err != nil {
-			return err
-		}
-		startOff = 0
-		maxReadCount -= readCount
-	}
-	return nil
+type logScopeFileOff struct {
+	ls       *logSet
+	startOff uint64
+	endOff   uint64
+	first    *raft.Entry
+	last     *raft.Entry
+}
+
+func (f *logScopeFileOff) inRegion(x uint64) bool {
+	return f.first.LogIndex <= x && f.last.LogIndex >= x
 }
 
 type raftLogManager struct {
@@ -591,7 +626,6 @@ func (mgr *raftLogManager) init() error {
 	if err != nil {
 		return err
 	}
-	// TODO 未提交完的数据? logIndex > lastCommitIndex
 	mgr.startBgLogSegClean()
 	return nil
 }
@@ -860,7 +894,8 @@ func (mgr *raftLogManager) commitLogWithOff(ctx *context.Context, start, end uin
 func (mgr *raftLogManager) commitLogWithOffV2(ctx *context.Context, start, end uint64) error {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
-	scope, err := newLogScope(mgr, start, end)
+	scope := newLogScope3(mgr, start, end)
+	err := scope.find()
 	if err != nil {
 		return err
 	}
