@@ -9,6 +9,8 @@ service raft {
   rpc InstallSnapshot(InstallSnapshotReq) returns (InstallSnapshotRsp);
   rpc GetLeader(GetLeaderReq) returns (GetLeaderRsp);
   rpc AppendCommands(AppendCommandsReq) returns (AppendCommandsRsp);
+  rpc LocalRead(LocalReadReq) returns (LocalReadRsp);
+  rpc LinnerRead(LinnerReadReq) returns (LinnerReadRsp);
 }
 
 
@@ -17,6 +19,11 @@ enum State {
   StateLeader = 1;
   StateFollower = 2;
   StateCandidate = 3;
+}
+
+enum CommandType {
+  NoOpCommand = 0;
+  UserCommand = 1;
 }
 
 message RequestVoteReq {
@@ -47,7 +54,8 @@ message AppendEntriesRsp {
 message Entry {
   uint64 term = 1;
   uint64 log_index = 2;
-  bytes command = 3;
+  uint32 command_type = 3;
+  bytes command = 4;
 }
 
 message InstallSnapshotReq {
@@ -80,4 +88,22 @@ message AppendCommandsReq {
 message AppendCommandsRsp {
   uint64 last_log_index = 1;
   uint64 last_log_term = 2;
+}
+
+message LocalReadReq {
+  string serial_no = 1;
+  bytes command = 2;
+}
+
+message LocalReadRsp {
+  bytes data = 1;
+}
+
+message LinnerReadReq {
+  string serial_no = 1;
+  bytes command = 2;
+}
+
+message LinnerReadRsp {
+  bytes data = 1;
 }

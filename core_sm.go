@@ -23,6 +23,7 @@ const (
 	smCommandGetLeader
 	smCommandAsyncRequestVoteComp
 	smCommandAsyncAppendEntriesComp
+	smCommandInsertNoOp
 )
 
 const (
@@ -201,20 +202,14 @@ func (s *CoreSm) startLoop() {
 					}
 					break
 				}
-				lastCommitIndex, err := s.logMgr.getLastCommitIndex(cmd.ctx)
-				if err != nil {
-					cmd.cq <- smCommandRes{
-						Rsp: nil,
-						Err: err,
-					}
-				}
+				indexVal := s.logMgr.getLogIndexVal(cmd.ctx)
 				s.rpc.asyncAppendEntries(cmd.ctx, &raft.AppendEntriesReq{
 					Term:         s.md.get().Term,
 					LeaderId:     s.rpc.My,
-					PrevLogIndex: s.logMgr.getLastLogIndex(cmd.ctx),
-					PrevLogTerm:  s.logMgr.getLastLogTerm(cmd.ctx),
+					PrevLogIndex: indexVal.lastLogIndex,
+					PrevLogTerm:  indexVal.lastLogTerm,
 					Entries:      nil,
-					LeaderCommit: lastCommitIndex,
+					LeaderCommit: indexVal.lastCommitIndex,
 				}, func(ctx *context.Context, res *asyncAppendEntriesRes) {
 					return
 				})
@@ -252,6 +247,11 @@ func (s *CoreSm) startLoop() {
 						Err: err,
 					}
 				}
+			case smCommandInsertNoOp:
+				err := s.insertNoOp(cmd.ctx)
+				if err != nil {
+					slog.Error("insert noop", slog.String("err", err.Error()), slog.String("my", s.rpc.My))
+				}
 			}
 		}
 	}
@@ -264,12 +264,39 @@ func (s *CoreSm) execCommandAsyncEntriesCompFromLoop(ctx *context.Context, anyRe
 	}
 	var err error
 	if len(anyReq.Req.Entries) > 0 {
-		err = s.logMgr.applyLog2UserSm(ctx, anyReq.Req.Entries)
-		if err != nil {
-			slog.Error(err.Error(), slog.String("logic", "applyLog2UserSm"))
-		}
+		s.logMgr.notifyNewCommit(anyReq.Req.PrevLogIndex + uint64(len(anyReq.Req.Entries)))
 	}
 	return rsp, err
+}
+
+func (s *CoreSm) insertNoOp(ctx *context.Context) error {
+	indexVal := s.logMgr.getLogIndexVal(ctx)
+	entries := []*raft.Entry{
+		{
+			Term:        indexVal.lastLogTerm,
+			LogIndex:    indexVal.lastLogIndex + 1,
+			CommandType: uint32(raft.CommandType_NoOpCommand),
+			Command:     []byte("raft-noop"),
+		},
+	}
+	err := s.logMgr.appendLog(ctx, entries)
+	if err != nil {
+		return err
+	}
+	s.rpc.asyncAppendEntries(ctx, &raft.AppendEntriesReq{
+		Term:         s.md.get().Term,
+		LeaderId:     s.rpc.Leader,
+		PrevLogIndex: indexVal.lastLogIndex,
+		PrevLogTerm:  indexVal.lastLogTerm,
+		Entries:      entries,
+	}, func(ctx *context.Context, res *asyncAppendEntriesRes) {
+		s.q <- smCommand{
+			typ:    smCommandAsyncAppendEntriesComp,
+			ctx:    ctx,
+			anyReq: res,
+		}
+	})
+	return nil
 }
 
 func (s *CoreSm) execCommandAsyncRequestVoteCompFromLoop(ctx *context.Context, res *asyncVoteRes) error {
@@ -278,23 +305,27 @@ func (s *CoreSm) execCommandAsyncRequestVoteCompFromLoop(ctx *context.Context, r
 	}
 	minVote := len(s.rpc.Membership)/2 + 1
 	if res.VoteCount >= uint64(minVote) {
-		lastCommitIndex, err := s.logMgr.getLastCommitIndex(ctx)
-		if err != nil {
-			return err
-		}
 		s.state = raft.State_StateLeader
 		s.rpc.Leader = s.rpc.My
 		slog.Info("my is leader, call broadcastAppendEntries2AllMemberShip", slog.String("my", s.rpc.My))
+		indexVal := s.logMgr.getLogIndexVal(ctx)
 		s.rpc.asyncAppendEntries(ctx, &raft.AppendEntriesReq{
 			Term:         s.md.get().Term,
 			LeaderId:     s.rpc.My,
-			PrevLogIndex: s.logMgr.getLastLogIndex(ctx),
-			PrevLogTerm:  s.logMgr.getLastLogTerm(ctx),
+			PrevLogIndex: indexVal.lastLogIndex,
+			PrevLogTerm:  indexVal.lastLogTerm,
 			Entries:      nil,
-			LeaderCommit: lastCommitIndex,
+			LeaderCommit: indexVal.lastCommitIndex,
 		}, func(ctx *context.Context, res *asyncAppendEntriesRes) {
+			// 插入no-op日志
+			s.q <- smCommand{
+				typ:    smCommandInsertNoOp,
+				ctx:    ctx,
+				anyReq: res,
+			}
 			return
 		})
+
 	}
 	return nil
 }
@@ -313,11 +344,12 @@ func (s *CoreSm) enterCandidate() error {
 	if err != nil {
 		return err
 	}
+	indexVal := s.logMgr.getLogIndexVal(ctx)
 	req := &raft.RequestVoteReq{
 		Term:         s.md.get().Term,
 		CandiDateId:  s.rpc.My,
-		LastLogIndex: s.logMgr.getLastLogIndex(ctx),
-		LastLogTerm:  s.logMgr.getLastLogTerm(ctx),
+		LastLogIndex: indexVal.lastLogIndex,
+		LastLogTerm:  indexVal.lastLogTerm,
 	}
 	s.rpc.asyncRequestVote(ctx, req, func(ctx *context.Context, res *asyncVoteRes) {
 		s.q <- smCommand{
@@ -341,11 +373,11 @@ func (s *CoreSm) execAppendCommandsFromLoop(ctx *context.Context, req *raft.Appe
 			count = len(commands)
 		}
 		entries := make([]*raft.Entry, 0, count)
-		lastLogIndex := s.logMgr.getLastLogIndex(ctx)
+		indexVal := s.logMgr.getLogIndexVal(ctx)
 		for idx, cmd := range commands[:count] {
 			entries = append(entries, &raft.Entry{
 				Term:     s.md.get().Term,
-				LogIndex: lastLogIndex + uint64(idx),
+				LogIndex: indexVal.lastLogIndex + uint64(idx),
 				Command:  cmd,
 			})
 		}
@@ -357,8 +389,8 @@ func (s *CoreSm) execAppendCommandsFromLoop(ctx *context.Context, req *raft.Appe
 		s.rpc.asyncAppendEntries(ctx, &raft.AppendEntriesReq{
 			Term:         s.md.get().Term,
 			LeaderId:     s.rpc.Leader,
-			PrevLogIndex: s.logMgr.getLastLogIndex(ctx),
-			PrevLogTerm:  s.logMgr.getLastLogTerm(ctx),
+			PrevLogIndex: indexVal.lastLogIndex,
+			PrevLogTerm:  indexVal.lastLogTerm,
 			Entries:      entries,
 		}, func(ctx *context.Context, res *asyncAppendEntriesRes) {
 			s.q <- smCommand{
@@ -386,6 +418,7 @@ func (s *CoreSm) execRequestVoteFromLoop(ctx *context.Context, req *raft.Request
 		return
 	}
 	md := *s.md.get()
+	indexVal := s.logMgr.getLogIndexVal(ctx)
 	rsp = &raft.RequestVoteRsp{}
 	if req.Term > md.Term {
 		md.Term = req.Term
@@ -394,7 +427,7 @@ func (s *CoreSm) execRequestVoteFromLoop(ctx *context.Context, req *raft.Request
 	} else if req.Term < md.Term {
 		rsp.VoteGranted = false
 		rsp.Term = md.Term
-	} else if req.LastLogTerm > s.logMgr.getLastLogTerm(ctx) || req.LastLogIndex > s.logMgr.getLastLogIndex(ctx) {
+	} else if req.LastLogTerm > indexVal.lastLogTerm || req.LastLogIndex > indexVal.lastLogIndex {
 		rsp.VoteGranted = true
 		rsp.Term = md.Term
 	}
@@ -417,26 +450,13 @@ func (s *CoreSm) execLeaderHeartBeatFromLoop(ctx *context.Context, req *raft.App
 		err = errors.New("term is greater than current term")
 		return
 	}
-	if s.logMgr.getLastLogIndex(ctx) > req.PrevLogIndex {
+	indexVal := s.logMgr.getLogIndexVal(ctx)
+	if indexVal.lastLogIndex > req.PrevLogIndex {
 		err = errors.New("prev log is greater than current log index")
 		return
 	}
 	if s.state == raft.State_StateFollower {
-		var lastCommitIndex uint64
-		lastCommitIndex, err = s.logMgr.getLastCommitIndex(ctx)
-		if err != nil {
-			return
-		}
-		if req.LeaderCommit > lastCommitIndex {
-			commitEnd := lastCommitIndex + 50
-			if req.LeaderCommit-lastCommitIndex < 50 {
-				commitEnd = req.LeaderCommit
-			}
-			err = s.logMgr.commitLogWithOffV2(ctx, lastCommitIndex+1, commitEnd)
-			if err != nil {
-				return
-			}
-		}
+		s.logMgr.notifyNewCommit(req.LeaderCommit)
 	}
 	if req.Term > s.md.get().Term {
 		s.state = raft.State_StateFollower
@@ -463,7 +483,8 @@ func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.Appen
 		err = errors.New("term is greater than current term")
 		return
 	}
-	if s.logMgr.getLastLogIndex(ctx) > req.PrevLogIndex {
+	indexVal := s.logMgr.getLogIndexVal(ctx)
+	if indexVal.lastLogIndex > req.PrevLogIndex {
 		err = errors.New("prev log is greater than current log index")
 		return
 	}

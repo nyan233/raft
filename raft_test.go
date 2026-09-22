@@ -46,7 +46,7 @@ func (t *testUserSm) Read() (uint64, uint64, error) {
 	return v1, v2, nil
 }
 
-func (t *testUserSm) LastCommit(ctx *context.Context) (uint64, error) {
+func (t *testUserSm) LastApplied(ctx *context.Context) (uint64, error) {
 	buf := make([]byte, 8)
 	n, err := t.file.ReadAt(buf, 0)
 	if err != nil {

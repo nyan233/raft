@@ -21,6 +21,13 @@ raft log设计为一个文件组, 有`idx`&`data`文件, `idx`仅存储log元数
 需要丢弃这些内容.
 状态机还要可以允许生成自己内部的快照, 以供`leader`快速将自己的数据同步给`follower`
 
+### 同步与复制
+`raft`协议中规定日志需要有三种`cursor`
+- `log_index`位置必须持久化, 记录了当前leader所有的写入记录
+- `commit_index`位置可以不持久化, 每次重启时从0开始, 等待leader当选并写入no-op日志, 将新的commitIndex通过appendEntries同步到follower中
+- `last_applied`持久化UserSm必须持久化, 通过计算commitIndex - last_applied得出要提交的日志项
+- 
+
 ## raft client
 
 ## 参考资料

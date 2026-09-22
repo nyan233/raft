@@ -7,7 +7,7 @@ import (
 
 type StateMachine interface {
 	Init(ctx *context.Context) error
-	LastCommit(ctx *context.Context) (uint64, error)
+	LastApplied(ctx *context.Context) (uint64, error)
 	Apply(ctx *context.Context, entries []*raft.Entry) error
 	Snapshot(ctx *context.Context) ([]*raft.Entry, error)
 }
