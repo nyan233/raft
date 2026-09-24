@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/nyan233/littlerpc/core/common/context"
@@ -24,6 +25,8 @@ const (
 	smCommandAsyncRequestVoteComp
 	smCommandAsyncAppendEntriesComp
 	smCommandInsertNoOp
+	smCommandAddServer
+	smCommandRemoveServer
 )
 
 const (
@@ -252,9 +255,76 @@ func (s *CoreSm) startLoop() {
 				if err != nil {
 					slog.Error("insert noop", slog.String("err", err.Error()), slog.String("my", s.rpc.My))
 				}
+			case smCommandAddServer:
+				rsp, err := s.execAddServerFromLoop(cmd.ctx, cmd.req.(*raft.AddServerReq))
+				cmd.cq <- smCommandRes{
+					Rsp: rsp,
+					Err: err,
+				}
+			case smCommandRemoveServer:
+				rsp, err := s.execRemoveServerFromLoop(cmd.ctx, cmd.req.(*raft.RemoveServerReq))
+				cmd.cq <- smCommandRes{
+					Rsp: rsp,
+					Err: err,
+				}
 			}
 		}
 	}
+}
+
+func (s *CoreSm) execAddServerFromLoop(ctx *context.Context, req *raft.AddServerReq) (rsp *raft.AddServerRsp, err error) {
+	rsp = new(raft.AddServerRsp)
+	if s.state != raft.State_StateLeader {
+		err = emitErr(raft.ErrCode_ErrNoLeader,
+			slog.Int("state", int(s.state)),
+			slog.String("my", s.rpc.My),
+		)
+		return
+	}
+	if req.NewServer == s.rpc.My || slices.Contains(s.rpc.Membership, req.NewServer) {
+		err = emitErr(raft.ErrCode_ErrChangeServerExists)
+		return
+	}
+	oldMemberList := append([]string{s.rpc.My}, s.rpc.Membership...)
+	newMemberList := append(oldMemberList, req.NewServer)
+	err = s.insertMemberChange(ctx, oldMemberList, newMemberList)
+	if err != nil {
+		return
+	}
+	return
+}
+
+func (s *CoreSm) execRemoveServerFromLoop(ctx *context.Context, req *raft.RemoveServerReq) (rsp *raft.RemoveServerRsp, err error) {
+	rsp = new(raft.RemoveServerRsp)
+	if s.state != raft.State_StateLeader {
+		err = emitErr(raft.ErrCode_ErrNoLeader,
+			slog.Int("state", int(s.state)),
+			slog.String("my", s.rpc.My),
+		)
+		return
+	}
+	if req.OldServer != s.rpc.My && !slices.Contains(s.rpc.Membership, req.OldServer) {
+		err = emitErr(raft.ErrCode_ErrChangeServerNotFound)
+		return
+	}
+	// TODO 移除自身
+	if req.OldServer == s.rpc.My {
+		err = fmt.Errorf("not support remove leader")
+		return
+	}
+	oldMemberList := append([]string{s.rpc.My}, s.rpc.Membership...)
+	newMemberList := append([]string(nil), oldMemberList...)
+	newMemberList = slices.DeleteFunc(newMemberList, func(s string) bool {
+		if s == req.OldServer {
+			return true
+		}
+		return false
+	})
+	err = s.insertMemberChange(ctx, oldMemberList, newMemberList)
+	if err != nil {
+		return
+	}
+	return
 }
 
 func (s *CoreSm) execCommandAsyncEntriesCompFromLoop(ctx *context.Context, anyReq *asyncAppendEntriesRes) (*raft.AppendCommandsRsp, error) {
@@ -270,13 +340,29 @@ func (s *CoreSm) execCommandAsyncEntriesCompFromLoop(ctx *context.Context, anyRe
 }
 
 func (s *CoreSm) insertNoOp(ctx *context.Context) error {
+	return s.insertOneLog(ctx, raft.CommandType_NoOpCommand, []byte("raft-noop"))
+}
+
+func (s *CoreSm) insertMemberChange(ctx *context.Context, old []string, new []string) error {
+	pbVal := &raft.LogMemberChange{
+		Old: old,
+		New: new,
+	}
+	marshalBytes, err := proto.Marshal(pbVal)
+	if err != nil {
+		return err
+	}
+	return s.insertOneLog(ctx, raft.CommandType_MemberChangeCommand, marshalBytes)
+}
+
+func (s *CoreSm) insertOneLog(ctx *context.Context, typ raft.CommandType, dat []byte) error {
 	indexVal := s.logMgr.getLogIndexVal(ctx)
 	entries := []*raft.Entry{
 		{
 			Term:        indexVal.lastLogTerm,
 			LogIndex:    indexVal.lastLogIndex + 1,
-			CommandType: uint32(raft.CommandType_NoOpCommand),
-			Command:     []byte("raft-noop"),
+			CommandType: uint32(typ),
+			Command:     dat,
 		},
 	}
 	err := s.logMgr.appendLog(ctx, entries)
@@ -364,7 +450,10 @@ func (s *CoreSm) enterCandidate() error {
 func (s *CoreSm) execAppendCommandsFromLoop(ctx *context.Context, req *raft.AppendCommandsReq, cq chan smCommandRes) error {
 	const OneMaxCount = 100
 	if !s.myIsLeader() {
-		return fmt.Errorf("my is not leader, addr=%s, state=%d", s.rpc.My, s.state)
+		return emitErr(raft.ErrCode_ErrNoLeader,
+			slog.Int("state", int(s.state)),
+			slog.String("my", s.rpc.My),
+		)
 	}
 	commands := req.Commands
 	for len(commands) > 0 {
@@ -573,6 +662,42 @@ func (s *CoreSm) execRequestVote(ctx *context.Context, req *raft.RequestVoteReq)
 			return nil, res.Err
 		}
 		rsp = res.Rsp.(*raft.RequestVoteRsp)
+	}
+	return rsp, nil
+}
+
+func (s *CoreSm) execAddServer(ctx *context.Context, req *raft.AddServerReq) (rsp *raft.AddServerRsp, err error) {
+	cq := make(chan smCommandRes, 1)
+	s.q <- smCommand{
+		typ: smCommandAddServer,
+		ctx: ctx,
+		req: req,
+		cq:  cq,
+	}
+	select {
+	case res := <-cq:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		rsp = res.Rsp.(*raft.AddServerRsp)
+	}
+	return rsp, nil
+}
+
+func (s *CoreSm) execRemoveServer(ctx *context.Context, req *raft.RemoveServerReq) (rsp *raft.RemoveServerRsp, err error) {
+	cq := make(chan smCommandRes, 1)
+	s.q <- smCommand{
+		typ: smCommandRemoveServer,
+		ctx: ctx,
+		req: req,
+		cq:  cq,
+	}
+	select {
+	case res := <-cq:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		rsp = res.Rsp.(*raft.RemoveServerRsp)
 	}
 	return rsp, nil
 }

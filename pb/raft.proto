@@ -11,6 +11,8 @@ service raft {
   rpc AppendCommands(AppendCommandsReq) returns (AppendCommandsRsp);
   rpc LocalRead(LocalReadReq) returns (LocalReadRsp);
   rpc LinnerRead(LinnerReadReq) returns (LinnerReadRsp);
+  rpc AddServer(AddServerReq) returns (AddServerRsp);
+  rpc RemoveServer(RemoveServerReq) returns (RemoveServerRsp);
 }
 
 
@@ -24,6 +26,16 @@ enum State {
 enum CommandType {
   NoOpCommand = 0;
   UserCommand = 1;
+  MemberChangeCommand = 2;
+}
+
+enum ErrCode {
+  ErrOk = 0;
+  ErrNoLeader = 10010;
+  ErrCurrentIsAddServer = 10011;
+  ErrCurrentIsRemoveServer = 10012;
+  ErrChangeServerExists = 10013;
+  ErrChangeServerNotFound = 10014;
 }
 
 message RequestVoteReq {
@@ -106,4 +118,25 @@ message LinnerReadReq {
 
 message LinnerReadRsp {
   bytes data = 1;
+}
+
+message AddServerReq {
+  string new_server = 1;
+}
+
+message AddServerRsp {
+  string leader_hint = 1;
+}
+
+message RemoveServerReq {
+  string old_server = 1;
+}
+
+message RemoveServerRsp {
+  string leader_hint = 2;
+}
+
+message LogMemberChange {
+  repeated string old = 1;
+  repeated string new = 2;
 }

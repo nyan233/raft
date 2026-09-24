@@ -3,7 +3,7 @@ package raft
 
 /*
    @Generator   : protoc-gen-go-lrpc
-   @CreateTime  : 2026-09-22 15:17:42.024464 +0800 CST
+   @CreateTime  : 2026-09-24 19:17:24.636612 +0800 CST
    @Author      : NoAuthor
    @Comment     : code is auto generate do not edit
 */
@@ -20,6 +20,10 @@ type RaftServer interface {
 	InstallSnapshot(ctx *context.Context, req *InstallSnapshotReq) (rsp *InstallSnapshotRsp, err error)
 	GetLeader(ctx *context.Context, req *GetLeaderReq) (rsp *GetLeaderRsp, err error)
 	AppendCommands(ctx *context.Context, req *AppendCommandsReq) (rsp *AppendCommandsRsp, err error)
+	LocalRead(ctx *context.Context, req *LocalReadReq) (rsp *LocalReadRsp, err error)
+	LinnerRead(ctx *context.Context, req *LinnerReadReq) (rsp *LinnerReadRsp, err error)
+	AddServer(ctx *context.Context, req *AddServerReq) (rsp *AddServerRsp, err error)
+	RemoveServer(ctx *context.Context, req *RemoveServerReq) (rsp *RemoveServerRsp, err error)
 }
 
 type UnImplRaftServer struct{}
@@ -41,6 +45,22 @@ func (s UnImplRaftServer) GetLeader(ctx *context.Context, req *GetLeaderReq) (rs
 }
 
 func (s UnImplRaftServer) AppendCommands(ctx *context.Context, req *AppendCommandsReq) (rsp *AppendCommandsRsp, err error) {
+	panic("not implemented")
+}
+
+func (s UnImplRaftServer) LocalRead(ctx *context.Context, req *LocalReadReq) (rsp *LocalReadRsp, err error) {
+	panic("not implemented")
+}
+
+func (s UnImplRaftServer) LinnerRead(ctx *context.Context, req *LinnerReadReq) (rsp *LinnerReadRsp, err error) {
+	panic("not implemented")
+}
+
+func (s UnImplRaftServer) AddServer(ctx *context.Context, req *AddServerReq) (rsp *AddServerRsp, err error) {
+	panic("not implemented")
+}
+
+func (s UnImplRaftServer) RemoveServer(ctx *context.Context, req *RemoveServerReq) (rsp *RemoveServerRsp, err error) {
 	panic("not implemented")
 }
 
@@ -66,6 +86,22 @@ var RaftServerDesc = server.Desc{
 			},
 			{
 				Name:    "AppendCommands",
+				Options: nil,
+			},
+			{
+				Name:    "LocalRead",
+				Options: nil,
+			},
+			{
+				Name:    "LinnerRead",
+				Options: nil,
+			},
+			{
+				Name:    "AddServer",
+				Options: nil,
+			},
+			{
+				Name:    "RemoveServer",
 				Options: nil,
 			},
 		},

@@ -1,13 +1,12 @@
 package raft
 
 import (
-	"errors"
+	"sync"
+
 	"github.com/nyan233/littlerpc/core/client"
 	"github.com/nyan233/littlerpc/core/common/context"
 	"github.com/nyan233/littlerpc/core/middle/ns"
 	"github.com/nyan233/raft/pb/message/raft"
-	"strings"
-	"sync"
 )
 
 type Client struct {
@@ -45,7 +44,7 @@ func (c *Client) doAppendCommands(ctx *context.Context, commands [][]byte) error
 			return err
 		}
 		if rsp.LeaderIp == "" {
-			return errors.New("no leader")
+			return emitErr(raft.ErrCode_ErrNoLeader)
 		}
 		c.leaderIp = rsp.LeaderIp
 	}
@@ -53,7 +52,7 @@ func (c *Client) doAppendCommands(ctx *context.Context, commands [][]byte) error
 		Commands: commands,
 	}, client.WithAddr(c.leaderIp))
 	if err != nil {
-		if strings.HasPrefix(err.Error(), "my is not leader") {
+		if rpcErrorIs(err, raft.ErrCode_ErrNoLeader) {
 			c.leaderIp = ""
 		}
 		return err

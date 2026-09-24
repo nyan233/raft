@@ -3,7 +3,7 @@ package raft
 
 /*
    @Generator   : protoc-gen-go-lrpc
-   @CreateTime  : 2026-09-22 15:17:42.024159 +0800 CST
+   @CreateTime  : 2026-09-24 19:17:24.635112 +0800 CST
    @Author      : NoAuthor
    @Comment     : code is auto generate do not edit
 */
@@ -14,11 +14,11 @@ import (
 )
 
 var (
-	_ caller0968f8accb734a5b94c1f7227e6bdcf8 = new(client.Client)
+	_ caller33bf980e27224367980c64673f6c1991 = new(client.Client)
 	_ RaftProxy                              = new(raftImpl)
 )
 
-type caller0968f8accb734a5b94c1f7227e6bdcf8 interface {
+type caller33bf980e27224367980c64673f6c1991 interface {
 	Request2(service string, opts []client.CallOption, reqCount int, args ...interface{}) error
 }
 
@@ -28,19 +28,23 @@ type RaftProxy interface {
 	InstallSnapshot(a0 *context.Context, a1 *InstallSnapshotReq, opts ...client.CallOption) (r0 *InstallSnapshotRsp, r1 error)
 	GetLeader(a0 *context.Context, a1 *GetLeaderReq, opts ...client.CallOption) (r0 *GetLeaderRsp, r1 error)
 	AppendCommands(a0 *context.Context, a1 *AppendCommandsReq, opts ...client.CallOption) (r0 *AppendCommandsRsp, r1 error)
+	LocalRead(a0 *context.Context, a1 *LocalReadReq, opts ...client.CallOption) (r0 *LocalReadRsp, r1 error)
+	LinnerRead(a0 *context.Context, a1 *LinnerReadReq, opts ...client.CallOption) (r0 *LinnerReadRsp, r1 error)
+	AddServer(a0 *context.Context, a1 *AddServerReq, opts ...client.CallOption) (r0 *AddServerRsp, r1 error)
+	RemoveServer(a0 *context.Context, a1 *RemoveServerReq, opts ...client.CallOption) (r0 *RemoveServerRsp, r1 error)
 }
 
 type raftImpl struct {
-	caller0968f8accb734a5b94c1f7227e6bdcf8
+	caller33bf980e27224367980c64673f6c1991
 }
 
-func NewRaft(b caller0968f8accb734a5b94c1f7227e6bdcf8) RaftProxy {
+func NewRaft(b caller33bf980e27224367980c64673f6c1991) RaftProxy {
 	proxy := new(raftImpl)
-	c, ok := b.(caller0968f8accb734a5b94c1f7227e6bdcf8)
+	c, ok := b.(caller33bf980e27224367980c64673f6c1991)
 	if !ok {
 		panic("the argument is not implemented caller")
 	}
-	proxy.caller0968f8accb734a5b94c1f7227e6bdcf8 = c
+	proxy.caller33bf980e27224367980c64673f6c1991 = c
 	return proxy
 }
 
@@ -71,5 +75,29 @@ func (p raftImpl) GetLeader(a0 *context.Context, a1 *GetLeaderReq, opts ...clien
 func (p raftImpl) AppendCommands(a0 *context.Context, a1 *AppendCommandsReq, opts ...client.CallOption) (r0 *AppendCommandsRsp, r1 error) {
 	r0 = new(AppendCommandsRsp)
 	r1 = p.Request2("raft.AppendCommands", opts, 2, a0, a1, r0)
+	return
+}
+
+func (p raftImpl) LocalRead(a0 *context.Context, a1 *LocalReadReq, opts ...client.CallOption) (r0 *LocalReadRsp, r1 error) {
+	r0 = new(LocalReadRsp)
+	r1 = p.Request2("raft.LocalRead", opts, 2, a0, a1, r0)
+	return
+}
+
+func (p raftImpl) LinnerRead(a0 *context.Context, a1 *LinnerReadReq, opts ...client.CallOption) (r0 *LinnerReadRsp, r1 error) {
+	r0 = new(LinnerReadRsp)
+	r1 = p.Request2("raft.LinnerRead", opts, 2, a0, a1, r0)
+	return
+}
+
+func (p raftImpl) AddServer(a0 *context.Context, a1 *AddServerReq, opts ...client.CallOption) (r0 *AddServerRsp, r1 error) {
+	r0 = new(AddServerRsp)
+	r1 = p.Request2("raft.AddServer", opts, 2, a0, a1, r0)
+	return
+}
+
+func (p raftImpl) RemoveServer(a0 *context.Context, a1 *RemoveServerReq, opts ...client.CallOption) (r0 *RemoveServerRsp, r1 error) {
+	r0 = new(RemoveServerRsp)
+	r1 = p.Request2("raft.RemoveServer", opts, 2, a0, a1, r0)
 	return
 }

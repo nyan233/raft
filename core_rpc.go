@@ -99,6 +99,26 @@ func (c *coreRpc) AppendCommands(ctx *context.Context, req *raft.AppendCommandsR
 	return c.sm.execAppendCommands(ctx, req)
 }
 
+func (c *coreRpc) LocalRead(ctx *context.Context, req *raft.LocalReadReq) (rsp *raft.LocalReadRsp, err error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c *coreRpc) LinnerRead(ctx *context.Context, req *raft.LinnerReadReq) (rsp *raft.LinnerReadRsp, err error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c *coreRpc) AddServer(ctx *context.Context, req *raft.AddServerReq) (rsp *raft.AddServerRsp, err error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c *coreRpc) RemoveServer(ctx *context.Context, req *raft.RemoveServerReq) (rsp *raft.RemoveServerRsp, err error) {
+	//TODO implement me
+	panic("implement me")
+}
+
 func (c *coreRpc) startAsyncQueueHandler() {
 	go func() {
 		for task := range c.asyncQ {
