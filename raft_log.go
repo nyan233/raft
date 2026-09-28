@@ -2,13 +2,9 @@ package raft
 
 import (
 	"cmp"
-	"encoding/binary"
 	"fmt"
-	"hash/crc32"
-	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,565 +16,8 @@ import (
 )
 
 const (
-	logDiskSize    = 4 + 8*4 + 4
 	logDataMaxSize = 1024 * 1024 // 1GB
 )
-
-type logDisk struct {
-	idxCheckSum  uint32
-	logIndex     uint64
-	logTerm      uint64
-	dataSize     uint64
-	dataOffset   uint64
-	dataCheckSum uint32
-	readData     []byte
-}
-
-func (d *logDisk) checkSum(buf *[]byte) {
-	checkSumBuf := *buf
-	binary.BigEndian.PutUint64(checkSumBuf[:8], d.logIndex)
-	binary.BigEndian.PutUint64(checkSumBuf[8:], d.logTerm)
-	binary.BigEndian.PutUint64(checkSumBuf[16:], d.dataSize)
-	binary.BigEndian.PutUint64(checkSumBuf[24:], d.dataOffset)
-	binary.BigEndian.PutUint32(checkSumBuf[32:], d.dataCheckSum)
-	checkSum := crc32.ChecksumIEEE(checkSumBuf)
-	d.idxCheckSum = checkSum
-}
-
-func (d *logDisk) writeToBuf(buf *[]byte) {
-	*buf = binary.BigEndian.AppendUint32(*buf, d.idxCheckSum)
-	*buf = binary.BigEndian.AppendUint64(*buf, d.logIndex)
-	*buf = binary.BigEndian.AppendUint64(*buf, d.logTerm)
-	*buf = binary.BigEndian.AppendUint64(*buf, d.dataSize)
-	*buf = binary.BigEndian.AppendUint64(*buf, d.dataOffset)
-	*buf = binary.BigEndian.AppendUint32(*buf, d.dataCheckSum)
-}
-
-func (d *logDisk) parse(buf []byte) error {
-	if len(buf) < logDiskSize {
-		return fmt.Errorf("logDisk too short")
-	}
-	d.idxCheckSum = binary.BigEndian.Uint32(buf[:4])
-	d.logIndex = binary.BigEndian.Uint64(buf[4:])
-	d.logTerm = binary.BigEndian.Uint64(buf[12:])
-	d.dataSize = binary.BigEndian.Uint64(buf[20:])
-	d.dataOffset = binary.BigEndian.Uint64(buf[28:])
-	d.dataCheckSum = binary.BigEndian.Uint32(buf[36:])
-	return nil
-}
-
-type logSet struct {
-	idx        *os.File
-	dat        *os.File
-	onlyAppend bool
-}
-
-func openLogSet(dir string, name string, write bool) (*logSet, error) {
-	var (
-		s    = &logSet{onlyAppend: write}
-		err  error
-		flag int
-	)
-	if write {
-		flag = os.O_CREATE | os.O_APPEND | os.O_WRONLY
-	} else {
-		flag = os.O_CREATE | os.O_RDWR
-	}
-	s.idx, err = os.OpenFile(filepath.Join(dir, name+".idx"), flag, 0644)
-	if err != nil {
-		return nil, err
-	}
-	s.dat, err = os.OpenFile(filepath.Join(dir, name+".dat"), flag, 0644)
-	if err != nil {
-		return nil, err
-	}
-	return s, nil
-}
-
-func openLogSegFile(dir, name string, segCount int) (*logSet, error) {
-	var (
-		s    = &logSet{onlyAppend: false}
-		err  error
-		flag = os.O_RDONLY
-	)
-	s.idx, err = os.OpenFile(filepath.Join(dir, name+".idx.seg."+strconv.Itoa(segCount)), flag, 0644)
-	if err != nil {
-		return nil, err
-	}
-	s.dat, err = os.OpenFile(filepath.Join(dir, name+".dat.seg."+strconv.Itoa(segCount)), flag, 0644)
-	if err != nil {
-		return nil, err
-	}
-	return s, nil
-}
-
-func (s *logSet) dataSize() (int64, error) {
-	if s.onlyAppend {
-		endOff, err := s.dat.Seek(0, io.SeekEnd)
-		if err != nil {
-			return 0, err
-		}
-		return endOff, nil
-	}
-	fi, err := s.dat.Stat()
-	if err != nil {
-		return 0, err
-	}
-	return fi.Size(), nil
-}
-
-func (s *logSet) close() error {
-	err := s.idx.Close()
-	if err != nil {
-		return err
-	}
-	err = s.dat.Close()
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *logSet) closeAndRenameSeg(n int) error {
-	idxName := s.idx.Name()
-	datName := s.dat.Name()
-	err := s.idx.Close()
-	if err != nil {
-		return err
-	}
-	err = s.dat.Close()
-	if err != nil {
-		return err
-	}
-	err = os.Rename(idxName, idxName+".seg."+strconv.Itoa(n))
-	if err != nil {
-		return err
-	}
-	err = os.Rename(datName, datName+".seg."+strconv.Itoa(n))
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *logSet) Remove() error {
-	idxName := s.idx.Name()
-	datName := s.dat.Name()
-	err := s.idx.Close()
-	if err != nil {
-		return err
-	}
-	err = s.dat.Close()
-	if err != nil {
-		return err
-	}
-	err = os.Remove(idxName)
-	if err != nil {
-		return err
-	}
-	err = os.Remove(datName)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *logSet) write(entries []*raft.Entry) error {
-	idxBuf := make([]byte, 0, logDiskSize*len(entries))
-	idxEntries := make([]*logDisk, 0, len(entries))
-	endSeek, err := s.dat.Seek(0, io.SeekEnd)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		writeCount, err2 := s.dat.Write(entry.Command)
-		if err2 != nil {
-			err = err2
-			return err
-		}
-		if writeCount != len(entry.Command) {
-			err = fmt.Errorf("write count not equal %d", writeCount)
-			return err
-		}
-		idxEntries = append(idxEntries, &logDisk{
-			logIndex:     entry.LogIndex,
-			logTerm:      entry.Term,
-			dataCheckSum: crc32.ChecksumIEEE(entry.Command),
-			dataOffset:   uint64(endSeek),
-			dataSize:     uint64(len(entry.Command)),
-		})
-		endSeek += int64(len(entry.Command))
-	}
-	err = s.dat.Sync()
-	if err != nil {
-		return err
-	}
-	checkSumBuf := make([]byte, logDiskSize-4)
-	for _, idxEntry := range idxEntries {
-		idxEntry.checkSum(&checkSumBuf)
-		idxEntry.writeToBuf(&idxBuf)
-	}
-	writeCount, err := s.idx.Write(idxBuf)
-	if err != nil {
-		return err
-	}
-	if writeCount != len(idxBuf) {
-		err = fmt.Errorf("write count not equal %d", writeCount)
-		return err
-	}
-	err = s.idx.Sync()
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *logSet) len() (int64, error) {
-	fi, err := s.idx.Stat()
-	if err != nil {
-		return 0, err
-	}
-	return fi.Size() / logDiskSize, nil
-}
-
-func (s *logSet) first(onlyIdx bool) (*raft.Entry, error) {
-	return s.readOff(0, onlyIdx)
-}
-
-func (s *logSet) last(onlyIdx bool) (*raft.Entry, error) {
-	info, err := s.idx.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if info.Size() == 0 {
-		return nil, nil
-	}
-	if info.Size() < logDiskSize {
-		return nil, fmt.Errorf("data corrupted")
-	}
-	off := (info.Size() / logDiskSize) - 1
-	return s.readOff(int(off), onlyIdx)
-}
-
-func (s *logSet) batchRead(startOff, count int, onlyIdx bool) ([]*raft.Entry, error) {
-	var (
-		offset      = startOff * logDiskSize
-		buf         = make([]byte, logDiskSize*count)
-		entries     = make([]*raft.Entry, 0, count)
-		logDiskList = make([]*logDisk, 0, count)
-	)
-	readCount, err := s.idx.ReadAt(buf, int64(offset))
-	if err != nil {
-		return nil, err
-	}
-	if err == io.EOF {
-		if readCount > 0 {
-			buf = buf[:readCount]
-		} else {
-			return nil, nil
-		}
-	}
-	for len(buf) > 0 {
-		var d logDisk
-		err = d.parse(buf[:logDiskSize])
-		if err != nil {
-			return nil, err
-		}
-		idxCk := crc32.ChecksumIEEE(buf[4:logDiskSize])
-		if idxCk != d.idxCheckSum {
-			err = fmt.Errorf("read idx checksum not equal %d", d.idxCheckSum)
-			return nil, err
-		}
-		logDiskList = append(logDiskList, &d)
-		entries = append(entries, &raft.Entry{
-			Term:     d.logTerm,
-			LogIndex: d.logIndex,
-		})
-		buf = buf[logDiskSize:]
-	}
-	if onlyIdx {
-		return entries, nil
-	}
-	firstLogDisk := logDiskList[0]
-	if len(entries) == 1 {
-		entry := entries[0]
-		buf = make([]byte, firstLogDisk.dataSize)
-		_, err = s.dat.ReadAt(buf, int64(firstLogDisk.dataOffset))
-		if err != nil {
-			return nil, err
-		}
-		if crc32.ChecksumIEEE(buf) != firstLogDisk.dataCheckSum {
-			err = fmt.Errorf("read dat checksum not equal %d", firstLogDisk.dataCheckSum)
-			return nil, err
-		}
-		entry.Command = buf
-	}
-	batchStart := firstLogDisk.dataOffset
-	batchEnd := firstLogDisk.dataOffset + firstLogDisk.dataSize
-	startParse := 0
-	dataBuf := make([]byte, 0, 1024)
-	batchReadFn := func(currentIndex int) error {
-		dataBufSize := batchEnd - batchStart
-		if uint64(cap(dataBuf)) < dataBufSize {
-			dataBuf = make([]byte, 0, dataBufSize)
-		}
-		dataBuf = dataBuf[:dataBufSize]
-		readCount, err = s.dat.ReadAt(dataBuf, int64(batchStart))
-		if err != nil {
-			return err
-		}
-		for k, v := range logDiskList[startParse : currentIndex+1] {
-			commandData := dataBuf[:v.dataSize]
-			if crc32.ChecksumIEEE(commandData) != v.dataCheckSum {
-				err = fmt.Errorf("read dat checksum not equal %d", v.dataCheckSum)
-				return err
-			}
-			entry := entries[k]
-			entry.Command = append(entry.Command, commandData...)
-			dataBuf = dataBuf[v.dataSize:]
-		}
-		return nil
-	}
-	for i := 1; i < len(logDiskList); i++ {
-		d := logDiskList[i]
-		if d.dataOffset == batchEnd {
-			batchEnd += d.dataSize
-		} else {
-			if err = batchReadFn(i); err != nil {
-				return nil, err
-			}
-			batchStart = d.dataOffset
-			batchEnd = d.dataOffset + d.dataSize
-			startParse = i
-		}
-		// 兜一下底
-		if startParse == len(logDiskList)-1 || i == len(logDiskList)-1 {
-			if err = batchReadFn(i); err != nil {
-				return nil, err
-			}
-		}
-	}
-	return entries, nil
-}
-
-func (s *logSet) truncate(count int) error {
-	truncateSize := logDiskSize * count
-	fi, err := s.idx.Stat()
-	if err != nil {
-		return err
-	}
-	idxSize := fi.Size()
-	return s.idx.Truncate(idxSize - int64(truncateSize))
-}
-
-func (s *logSet) readOff(idx int, onlyIdx bool) (*raft.Entry, error) {
-	var (
-		off = idx * logDiskSize
-		buf = make([]byte, logDiskSize)
-		d   logDisk
-	)
-	readCount, err := s.idx.ReadAt(buf, int64(off))
-	if err == io.EOF {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if readCount == 0 {
-		return nil, nil
-	}
-	if readCount != len(buf) {
-		err = fmt.Errorf("read count not equal %d", readCount)
-		return nil, err
-	}
-	err = d.parse(buf)
-	if err != nil {
-		return nil, err
-	}
-	idxCk := crc32.ChecksumIEEE(buf[4:])
-	if idxCk != d.idxCheckSum {
-		err = fmt.Errorf("read idx checksum not equal %d", d.idxCheckSum)
-		return nil, err
-	}
-	if onlyIdx {
-		return &raft.Entry{
-			Term:     d.logTerm,
-			LogIndex: d.logIndex,
-			Command:  nil,
-		}, nil
-	}
-	dataBuf := make([]byte, d.dataSize)
-	readCount, err = s.dat.ReadAt(dataBuf, int64(d.dataOffset))
-	if err != nil {
-		return nil, err
-	}
-	if readCount != int(d.dataSize) {
-		err = fmt.Errorf("read count not equal %d", readCount)
-		return nil, err
-	}
-	dataCk := crc32.ChecksumIEEE(dataBuf)
-	if dataCk != d.dataCheckSum {
-		err = fmt.Errorf("read dat checksum not equal %d", d.dataCheckSum)
-		return nil, err
-	}
-	e := &raft.Entry{
-		LogIndex: d.logIndex,
-		Term:     d.logTerm,
-		Command:  dataBuf,
-	}
-	return e, nil
-}
-
-type logScope3 struct {
-	m          *raftLogManager
-	startIndex uint64
-	endIndex   uint64
-	fileOff    []logScopeFileOff
-}
-
-func newLogScope3(m *raftLogManager, startIndex, endIndex uint64) *logScope3 {
-	return &logScope3{
-		m:          m,
-		startIndex: startIndex,
-		endIndex:   endIndex,
-		fileOff:    make([]logScopeFileOff, 0, 8),
-	}
-}
-
-func (s *logScope3) findStart() (foundStart bool, err error) {
-	firstEntry, err := s.m.r.first(true)
-	if err != nil {
-		return false, err
-	}
-	lastEntry, err := s.m.r.last(false)
-	if err != nil {
-		return false, err
-	}
-	appendFileOff := func(ls *logSet, first, last *raft.Entry) (foundStart bool) {
-		fileOff := logScopeFileOff{
-			ls:       ls,
-			startOff: 0,
-			endOff:   lastEntry.LogIndex - firstEntry.LogIndex,
-			first:    first,
-			last:     last,
-		}
-		if fileOff.inRegion(s.startIndex) {
-			fileOff.startOff = s.startIndex - firstEntry.LogIndex
-			s.fileOff = append(s.fileOff, fileOff)
-			return true
-		}
-		s.fileOff = append(s.fileOff, fileOff)
-		return false
-	}
-	if firstEntry != nil {
-		if foundStart = appendFileOff(s.m.r, firstEntry, lastEntry); foundStart {
-			return
-		}
-	}
-	segList, err := s.m.getSegList(true)
-	if err != nil {
-		return false, err
-	}
-	for _, seg := range segList {
-		ls, err := openLogSegFile(s.m.dirPath, s.m.logName, seg)
-		if err != nil {
-			return false, err
-		}
-		firstEntry, err = ls.first(false)
-		if err != nil {
-			return false, err
-		}
-		lastEntry, err = ls.last(false)
-		if err != nil {
-			return false, err
-		}
-		if appendFileOff(ls, firstEntry, lastEntry) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func (s *logScope3) findEnd() error {
-	trimCount := 0
-	for i := 0; i < len(s.fileOff); i++ {
-		fileOff := s.fileOff[i]
-		if fileOff.inRegion(s.endIndex) {
-			break
-		} else {
-			// 超过当前文件的有的索引范围
-			if i == 0 && s.endIndex > fileOff.last.LogIndex {
-				return fmt.Errorf("end index is out of range, end index is %d, last index is %d", s.endIndex, fileOff.last.LogIndex)
-			}
-			trimCount++
-			if fileOff.ls != s.m.r {
-				err := fileOff.ls.close()
-				if err != nil {
-					return err
-				}
-			}
-		}
-	}
-	s.fileOff = s.fileOff[trimCount:]
-	s.fileOff[0].endOff = s.endIndex - s.fileOff[0].first.LogIndex
-	return nil
-}
-
-func (s *logScope3) find() error {
-	if s.startIndex > s.endIndex {
-		return fmt.Errorf("start index is out of range, end index is %d", s.endIndex)
-	}
-	foundStart, err := s.findStart()
-	if err != nil {
-		s.close()
-		return err
-	}
-	if !foundStart {
-		s.close()
-		return fmt.Errorf("unknown file offset, startIndex=%d, endIndex=%d", s.startIndex, s.endIndex)
-	}
-	err = s.findEnd()
-	if err != nil {
-		s.close()
-		return err
-	}
-	return nil
-}
-
-func (s *logScope3) rangeFor(fn func(f *logSet, startOff, count uint64) error) error {
-	for i := len(s.fileOff) - 1; i >= 0; i-- {
-		ff := s.fileOff[i]
-		err := fn(ff.ls, ff.startOff, (ff.endOff-ff.startOff)+1)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *logScope3) close() error {
-	for _, f := range s.fileOff {
-		if f.ls != s.m.r {
-			err := f.ls.close()
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-type logScopeFileOff struct {
-	ls       *logSet
-	startOff uint64
-	endOff   uint64
-	first    *raft.Entry
-	last     *raft.Entry
-}
-
-func (f *logScopeFileOff) inRegion(x uint64) bool {
-	return f.first.LogIndex <= x && f.last.LogIndex >= x
-}
 
 type raftLogIndexVal struct {
 	lastLogIndex    uint64
@@ -592,8 +31,8 @@ type raftLogManager struct {
 	indexVal   *raftLogIndexVal
 	dirPath    string
 	logName    string
-	r          *logSet
-	w          *logSet
+	r          *diskList
+	w          *diskList
 	sm         StateMachine
 	maxLogSeg  int
 	applyEvent chan struct{}
@@ -611,11 +50,11 @@ func newRaftLogManager(dirPath string, logName string, sm StateMachine) *raftLog
 
 func (mgr *raftLogManager) init() error {
 	var err error
-	mgr.r, err = openLogSet(mgr.dirPath, mgr.logName, false)
+	mgr.r, err = openDiskList(mgr.dirPath, mgr.logName, false)
 	if err != nil {
 		return err
 	}
-	mgr.w, err = openLogSet(mgr.dirPath, mgr.logName, true)
+	mgr.w, err = openDiskList(mgr.dirPath, mgr.logName, true)
 	if err != nil {
 		return err
 	}
@@ -686,7 +125,7 @@ func (mgr *raftLogManager) initSeg() error {
 	if mgr.indexVal.lastLogIndex != 0 {
 		return nil
 	}
-	segFs, err := openLogSegFile(mgr.dirPath, mgr.logName, segList[len(segList)-1])
+	segFs, err := openDiskListSegFile(mgr.dirPath, mgr.logName, segList[len(segList)-1])
 	if err != nil {
 		return err
 	}
@@ -709,11 +148,11 @@ func (mgr *raftLogManager) mergeLogFile() error {
 		return err
 	}
 	mgr.maxLogSeg++
-	mgr.w, err = openLogSet(mgr.dirPath, mgr.logName, true)
+	mgr.w, err = openDiskList(mgr.dirPath, mgr.logName, true)
 	if err != nil {
 		return err
 	}
-	mgr.r, err = openLogSet(mgr.dirPath, mgr.logName, false)
+	mgr.r, err = openDiskList(mgr.dirPath, mgr.logName, false)
 	if err != nil {
 		return err
 	}
@@ -819,7 +258,7 @@ func (mgr *raftLogManager) cleanLogSeg() {
 	//	}
 	//}
 	for _, seg := range segList {
-		segFile, err := openLogSegFile(mgr.dirPath, mgr.logName, seg)
+		segFile, err := openDiskListSegFile(mgr.dirPath, mgr.logName, seg)
 		if err != nil {
 			return
 		}
@@ -924,13 +363,13 @@ func (mgr *raftLogManager) doApplyLog2UserSm(ctx *context.Context, entries []*ra
 }
 
 func (mgr *raftLogManager) applyLogWithOffV2(ctx *context.Context, start, end uint64) error {
-	scope := newLogScope3(mgr, start, end)
+	scope := newListScope3(mgr, start, end)
 	err := scope.find()
 	if err != nil {
 		return err
 	}
 	entries := make([]*raft.Entry, 0, 128)
-	err = scope.rangeFor(func(f *logSet, startOff, count uint64) error {
+	err = scope.rangeFor(func(f *diskList, startOff, count uint64) error {
 		readEntries, err := f.batchRead(int(startOff), int(count), false)
 		if err != nil {
 			return err

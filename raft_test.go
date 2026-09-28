@@ -177,7 +177,7 @@ func TestSmRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("lastCommitIndex=%d, count=%d", lastCommitIndex, count)
-	ls, err := openLogSet("test", NodeName, false)
+	ls, err := openDiskList("test", NodeName, false)
 	if err != nil {
 		t.Fatal(err)
 	}

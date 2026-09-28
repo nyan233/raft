@@ -14,11 +14,11 @@ import (
 func TestRaftLog(t *testing.T) {
 	os.Remove(filepath.Join("test", "testlog1.idx"))
 	os.Remove(filepath.Join("test", "testlog1.dat"))
-	w, err := openLogSet("test", "testlog1", true)
+	w, err := openDiskList("test", "testlog1", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := openLogSet("test", "testlog1", false)
+	r, err := openDiskList("test", "testlog1", false)
 	if err != nil {
 		t.Fatal(err)
 	}

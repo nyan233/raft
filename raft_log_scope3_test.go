@@ -22,7 +22,7 @@ func scope3Fixture(t *testing.T, segments [][2]uint64, mainBounds *[2]uint64) *r
 	}
 	writeSet := func(name string, bounds *[2]uint64) {
 		t.Helper()
-		w, err := openLogSet(dir, name, true)
+		w, err := openDiskList(dir, name, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -47,7 +47,7 @@ func scope3Fixture(t *testing.T, segments [][2]uint64, mainBounds *[2]uint64) *r
 		}
 	}
 	writeSet("log", mainBounds)
-	r, err := openLogSet(dir, "log", false)
+	r, err := openDiskList(dir, "log", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestLogScope3Ranges(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := scope3Fixture(t, tc.segments, tc.main)
-			s := newLogScope3(m, tc.start, tc.end)
+			s := newListScope3(m, tc.start, tc.end)
 			defer func() {
 				if p := recover(); p != nil {
 					t.Errorf("unexpected panic: %v", p)
@@ -110,7 +110,7 @@ func TestLogScope3Ranges(t *testing.T) {
 				t.Fatal(err)
 			}
 			var got []*pb.Entry
-			err = s.rangeFor(func(f *logSet, start, count uint64) error {
+			err = s.rangeFor(func(f *diskList, start, count uint64) error {
 				// Bound allocations even if unsigned offset arithmetic regresses.
 				if count == 0 || count > tc.end-tc.start+1 {
 					return fmt.Errorf("invalid read count %d", count)
@@ -133,7 +133,7 @@ func TestLogScope3Ranges(t *testing.T) {
 			}
 			sentinel := errors.New("stop reading")
 			calls := 0
-			if err := s.rangeFor(func(*logSet, uint64, uint64) error { calls++; return sentinel }); !errors.Is(err, sentinel) || calls != 1 {
+			if err := s.rangeFor(func(*diskList, uint64, uint64) error { calls++; return sentinel }); !errors.Is(err, sentinel) || calls != 1 {
 				t.Errorf("callback error not propagated: err=%v calls=%d", err, calls)
 			}
 		})
