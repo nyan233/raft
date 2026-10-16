@@ -3,7 +3,7 @@ package raft
 
 /*
    @Generator   : protoc-gen-go-lrpc
-   @CreateTime  : 2026-09-24 19:17:24.636612 +0800 CST
+   @CreateTime  : 2026-10-16 19:19:52.062594 +0800 CST
    @Author      : NoAuthor
    @Comment     : code is auto generate do not edit
 */

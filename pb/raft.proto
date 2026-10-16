@@ -36,6 +36,9 @@ enum ErrCode {
   ErrCurrentIsRemoveServer = 10012;
   ErrChangeServerExists = 10013;
   ErrChangeServerNotFound = 10014;
+  ErrInvalidRequest = 10015;
+  ErrVoteForByTerm = 10016;
+  ErrTermLtCurrent = 10017;
 }
 
 message RequestVoteReq {
@@ -61,6 +64,9 @@ message AppendEntriesReq {
 
 message AppendEntriesRsp {
   uint64 term = 1;
+  bool success = 2;
+  uint64 conflict_term = 3;
+  uint64 conflict_index = 4;
 }
 
 message Entry {

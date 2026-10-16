@@ -119,6 +119,10 @@ func (c *coreRpc) RemoveServer(ctx *context.Context, req *raft.RemoveServerReq) 
 	panic("implement me")
 }
 
+func (c *coreRpc) minSuccessReq() int {
+	return (len(c.Membership)+1)/2 + 1
+}
+
 func (c *coreRpc) startAsyncQueueHandler() {
 	go func() {
 		for task := range c.asyncQ {
@@ -128,7 +132,7 @@ func (c *coreRpc) startAsyncQueueHandler() {
 					task.Ctx,
 					task.Req.(*raft.AppendEntriesReq),
 					task.Callback.(func(ctx *context.Context, res *asyncAppendEntriesRes)),
-					len(c.Membership)/2+1,
+					c.minSuccessReq(),
 				)
 			}
 		}

@@ -3,7 +3,6 @@ package raft
 import (
 	"cmp"
 	"fmt"
-	"log/slog"
 	"os"
 	"slices"
 	"strconv"
@@ -27,24 +26,22 @@ type raftLogIndexVal struct {
 }
 
 type raftLogManager struct {
-	mu         sync.RWMutex
-	indexVal   *raftLogIndexVal
-	dirPath    string
-	logName    string
-	r          *diskList
-	w          *diskList
-	sm         StateMachine
-	maxLogSeg  int
-	applyEvent chan struct{}
+	mu        sync.RWMutex
+	indexVal  *raftLogIndexVal
+	dirPath   string
+	logName   string
+	r         *diskList
+	w         *diskList
+	sm        StateMachine
+	maxLogSeg int
 }
 
 func newRaftLogManager(dirPath string, logName string, sm StateMachine) *raftLogManager {
 	return &raftLogManager{
-		dirPath:    dirPath,
-		logName:    logName,
-		sm:         sm,
-		indexVal:   new(raftLogIndexVal),
-		applyEvent: make(chan struct{}, 128),
+		dirPath:  dirPath,
+		logName:  logName,
+		sm:       sm,
+		indexVal: new(raftLogIndexVal),
 	}
 }
 
@@ -76,7 +73,6 @@ func (mgr *raftLogManager) init() error {
 		return err
 	}
 	mgr.startBgLogSegClean()
-	mgr.startBgLogApply()
 	return nil
 }
 
@@ -171,55 +167,6 @@ func (mgr *raftLogManager) startBgLogSegClean() {
 	}()
 }
 
-func (mgr *raftLogManager) startBgLogApply() {
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-mgr.applyEvent:
-				err := mgr.doLogApply()
-				if err != nil {
-					slog.Error("bg log apply",
-						slog.String("err", err.Error()),
-					)
-				}
-				ticker.Reset(time.Second)
-			case <-ticker.C:
-				err := mgr.doLogApply()
-				if err != nil {
-					slog.Error("bg log apply",
-						slog.String("err", err.Error()),
-					)
-				}
-			}
-		}
-	}()
-}
-
-func (mgr *raftLogManager) doLogApply() error {
-	mgr.mu.RLock()
-	defer mgr.mu.RUnlock()
-	ctx := context.Background()
-	lastApplied, err := mgr.sm.LastApplied(ctx)
-	if err != nil {
-		return err
-	}
-	if lastApplied > mgr.indexVal.lastCommitIndex || lastApplied == mgr.indexVal.lastCommitIndex {
-		return nil
-	}
-	applyEnd := mgr.indexVal.lastCommitIndex
-	if applyEnd > lastApplied+100 {
-		applyEnd = lastApplied + 100
-	}
-	err = mgr.applyLogWithOffV2(ctx, lastApplied, applyEnd)
-	if err != nil {
-		return err
-	}
-	mgr.indexVal.lastApplied = applyEnd
-	return nil
-}
-
 // 清理lastCommit >= .seg.logIndex的文件, 未提交完的不清理
 func (mgr *raftLogManager) cleanLogSeg() {
 	defer func() {
@@ -238,25 +185,8 @@ func (mgr *raftLogManager) cleanLogSeg() {
 	if err != nil {
 		return
 	}
-	//entry, err := mgr.r.first(true)
-	//if err != nil {
-	//	return
-	//}
-	//if entry == nil {
-	//	if len(segList) > 1 {
-	//		for _, segC := range segList[:len(segList)-1] {
-	//			idxFileName, datFileName := mgr.getSegFileName(segC)
-	//			os.Remove(filepath.Join(mgr.dirPath, idxFileName))
-	//			os.Remove(filepath.Join(mgr.dirPath, datFileName))
-	//		}
-	//	}
-	//} else {
-	//	for _, segC := range segList {
-	//		idxFileName, datFileName := mgr.getSegFileName(segC)
-	//		os.Remove(filepath.Join(mgr.dirPath, idxFileName))
-	//		os.Remove(filepath.Join(mgr.dirPath, datFileName))
-	//	}
-	//}
+	// NOTE 2026/10/16 保留最后一条日志, 用于AppendEntries日志检查
+	cleanEnd := lastApplied - 1
 	for _, seg := range segList {
 		segFile, err := openDiskListSegFile(mgr.dirPath, mgr.logName, seg)
 		if err != nil {
@@ -266,7 +196,7 @@ func (mgr *raftLogManager) cleanLogSeg() {
 		if err != nil {
 			return
 		}
-		if lastEntry.LogIndex <= lastApplied {
+		if lastEntry.LogIndex <= cleanEnd {
 			err = segFile.Remove()
 			if err != nil {
 				return
@@ -275,16 +205,10 @@ func (mgr *raftLogManager) cleanLogSeg() {
 	}
 }
 
-func (mgr *raftLogManager) notifyNewCommit(idx uint64) {
+func (mgr *raftLogManager) setCommitIndex(idx uint64) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	mgr.indexVal.lastCommitIndex = idx
-	select {
-	case mgr.applyEvent <- struct{}{}:
-		break
-	default:
-		break
-	}
 }
 
 func (mgr *raftLogManager) getLogIndexVal(ctx *context.Context) raftLogIndexVal {
@@ -322,15 +246,6 @@ func (mgr *raftLogManager) appendLog(ctx *context.Context, entries []*raft.Entry
 	return nil
 }
 
-func (mgr *raftLogManager) applyLog2UserSm(ctx *context.Context, entries []*raft.Entry) error {
-	if len(entries) == 0 {
-		return nil
-	}
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-	return mgr.doApplyLog2UserSm(ctx, entries)
-}
-
 func (mgr *raftLogManager) doApplyLog2UserSm(ctx *context.Context, entries []*raft.Entry) error {
 	// 分批次应用, 单次最多500条
 	const OneMaxCount = 500
@@ -347,6 +262,7 @@ func (mgr *raftLogManager) doApplyLog2UserSm(ctx *context.Context, entries []*ra
 			return err
 		}
 		entries = entries[count:]
+		mgr.indexVal.lastApplied += uint64(count)
 	}
 	logSize, err := mgr.w.dataSize()
 	if err != nil {
@@ -362,7 +278,7 @@ func (mgr *raftLogManager) doApplyLog2UserSm(ctx *context.Context, entries []*ra
 	return nil
 }
 
-func (mgr *raftLogManager) applyLogWithOffV2(ctx *context.Context, start, end uint64) error {
+func (mgr *raftLogManager) noLockDoApplyLogWithOffV2(ctx *context.Context, start, end uint64) error {
 	scope := newListScope3(mgr, start, end)
 	err := scope.find()
 	if err != nil {
@@ -389,4 +305,87 @@ func (mgr *raftLogManager) applyLogWithOffV2(ctx *context.Context, start, end ui
 		return err
 	}
 	return nil
+}
+
+func (mgr *raftLogManager) applyLogWithOffV2(ctx *context.Context, start, end uint64) error {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	return mgr.noLockDoApplyLogWithOffV2(ctx, start, end)
+}
+
+func (mgr *raftLogManager) applyLogWithCount(ctx *context.Context, count int) error {
+	if count <= 0 {
+		return nil
+	}
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	oldApplied := mgr.indexVal.lastApplied
+	newApplied := oldApplied + uint64(count)
+	return mgr.noLockDoApplyLogWithOffV2(ctx, oldApplied, newApplied)
+}
+
+func (mgr *raftLogManager) newScope(ctx *context.Context, start, end uint64) (*listScope3, error) {
+	scope := newListScope3(mgr, start, end)
+	err := scope.find()
+	if err != nil {
+		return nil, err
+	}
+	return scope, nil
+}
+
+func (mgr *raftLogManager) readLogWithIndex(ctx *context.Context, start, end uint64) ([]*raft.Entry, error) {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	scope, err := mgr.newScope(ctx, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer scope.close()
+	entries := make([]*raft.Entry, 0, end-start)
+	err = scope.rangeFor(func(f *diskList, startOff, count uint64) error {
+		readEntries, err := f.batchRead(int(startOff), int(count), false)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, readEntries...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+func (mgr *raftLogManager) readLog(ctx *context.Context, index uint64, onlyIdx bool) (*raft.Entry, error) {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	scope, err := mgr.newScope(ctx, index, index)
+	if err != nil {
+		return nil, err
+	}
+	defer scope.close()
+	var entry *raft.Entry
+	err = scope.rangeFor(func(f *diskList, startOff, count uint64) error {
+		entry, err = f.readOff(int(startOff), onlyIdx)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entry, nil
+}
+
+func (mgr *raftLogManager) lastLog(ctx *context.Context, onlyIdx bool) (*raft.Entry, error) {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	return mgr.r.last(onlyIdx)
+}
+
+func (mgr *raftLogManager) firstLog(ctx *context.Context, onlyIdx bool) (*raft.Entry, error) {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	return mgr.r.first(onlyIdx)
 }

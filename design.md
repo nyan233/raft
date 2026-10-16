@@ -26,7 +26,20 @@ raft log设计为一个文件组, 有`idx`&`data`文件, `idx`仅存储log元数
 - `log_index`位置必须持久化, 记录了当前leader所有的写入记录
 - `commit_index`位置可以不持久化, 每次重启时从0开始, 等待leader当选并写入no-op日志, 将新的commitIndex通过appendEntries同步到follower中
 - `last_applied`持久化UserSm必须持久化, 通过计算commitIndex - last_applied得出要提交的日志项
-- 
+
+### 复制进度管理器
+`raft`leader负责跟踪follower的复制进度, 通常有以下两个索引
+- `matchIndex` follower当前已复制的索引
+- `nextIndex` follower下次准备复制的索引
+
+复制相关事宜都由该管理器管理, appendCommands执行期间, 先把日志写入到leader本地存储, 随后通知进度管理器准备开始
+新的复制, hold住appendCommands请求, 待该请求设计的index范围达成多数票时unhold并callback handler, 如果该请求实际已超时则不返回结果.
+进度管理器始终跟踪follower的进度并将leader日志同步给follower, 达成多数派后推进leader commit, 并通过心跳将leader commit通知各个follower.
+推进提交的时机有以下两种
+- appendCommands触发的事件
+- 定时器兜底
+
+如果像是新节点进来的这种情况, 某个节点日志落后太多的进度管理器会看情况进入安装快照流程
 
 ## raft client
 
