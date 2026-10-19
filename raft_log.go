@@ -217,18 +217,21 @@ func (mgr *raftLogManager) getLogIndexVal(ctx *context.Context) raftLogIndexVal 
 	return *mgr.indexVal
 }
 
-func (mgr *raftLogManager) appendLog(ctx *context.Context, entries []*raft.Entry) error {
+func (mgr *raftLogManager) appendLog(ctx *context.Context, term uint64, entries []*raft.Entry) (uint64, uint64, error) {
 	if len(entries) == 0 {
-		return nil
+		return mgr.indexVal.lastLogIndex, mgr.indexVal.lastLogIndex, nil
 	}
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
+	for i := uint64(0); i < uint64(len(entries)); i++ {
+		entries[i].Term = term
+		entries[i].LogIndex = mgr.indexVal.lastLogIndex + i + 1
+	}
 	// 分批次应用, 单次最多500条
 	const OneMaxCount = 500
 	var (
-		count      int
-		wbEntries  = entries
-		numEntries = len(entries)
+		count     int
+		wbEntries = entries
 	)
 	for len(wbEntries) > 0 {
 		count = OneMaxCount
@@ -237,13 +240,13 @@ func (mgr *raftLogManager) appendLog(ctx *context.Context, entries []*raft.Entry
 		}
 		err := mgr.w.write(wbEntries[:count])
 		if err != nil {
-			return err
+			return 0, 0, err
 		}
 		wbEntries = wbEntries[count:]
 	}
-	mgr.indexVal.lastLogIndex += uint64(numEntries)
-	mgr.indexVal.lastLogTerm = entries[len(entries)-1].Term
-	return nil
+	mgr.indexVal.lastLogIndex = entries[len(entries)-1].LogIndex
+	mgr.indexVal.lastLogTerm = term
+	return entries[0].LogIndex, mgr.indexVal.lastLogIndex, nil
 }
 
 func (mgr *raftLogManager) doApplyLog2UserSm(ctx *context.Context, entries []*raft.Entry) error {
