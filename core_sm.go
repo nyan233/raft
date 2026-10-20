@@ -629,16 +629,27 @@ func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.Appen
 		return
 	}
 	indexVal := s.logMgr.getLogIndexVal(ctx)
-	if indexVal.lastLogIndex > req.PrevLogIndex {
-		err = errors.New("prev log is greater than current log index")
-		return
+	type logCheckScope struct {
+		S uint64
+		E uint64
 	}
-	_, _, err = s.logMgr.appendLog(ctx, myTerm, req.Entries)
-	if err != nil {
-		return
+	scope := logCheckScope{
+		S: indexVal.lastApplied,
+		E: indexVal.lastLogIndex,
 	}
-	rsp.Term = myTerm
-	return rsp, nil
+	// f_applied: 105
+	// f_log_list: 106~110
+	// l_log_prev_log: 107
+	// leader日志索引从follower有效索引范围中开始, 需要校验logTerm, 不一致的话follower需要truncate, leader需要回退
+	if scope.S < req.PrevLogIndex && req.PrevLogIndex < scope.E {
+		logEntry, err := s.logMgr.readLog(ctx, req.PrevLogIndex, false)
+		if err != nil {
+			return nil, err
+		}
+		if logEntry.Term != req.PrevLogTerm {
+
+		}
+	}
 }
 
 func (s *CoreSm) execGetLeader(ctx *context.Context, req *raft.GetLeaderReq) (rsp *raft.GetLeaderRsp, err error) {

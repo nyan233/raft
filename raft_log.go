@@ -45,7 +45,7 @@ func newRaftLogManager(dirPath string, logName string, sm StateMachine) *raftLog
 	}
 }
 
-func (mgr *raftLogManager) init() error {
+func (mgr *raftLogManager) initFile() error {
 	var err error
 	mgr.r, err = openDiskList(mgr.dirPath, mgr.logName, false)
 	if err != nil {
@@ -67,6 +67,14 @@ func (mgr *raftLogManager) init() error {
 	if err != nil {
 		return err
 	}
+	return nil
+}
+
+func (mgr *raftLogManager) init() error {
+	err := mgr.initFile()
+	if err != nil {
+		return err
+	}
 	ctx := context.Background()
 	err = mgr.sm.Init(ctx)
 	if err != nil {
@@ -82,7 +90,7 @@ func (mgr *raftLogManager) getSegFileName(segCount int) (string, string) {
 	return idx, dat
 }
 
-func (mgr *raftLogManager) getSegList(isDesc bool) ([]int, error) {
+func (mgr *raftLogManager) getSegList(descSort bool) ([]int, error) {
 	dirEntry, err := os.ReadDir(mgr.dirPath)
 	if err != nil {
 		return nil, err
@@ -99,7 +107,7 @@ func (mgr *raftLogManager) getSegList(isDesc bool) ([]int, error) {
 			segList = append(segList, segCount)
 		}
 	}
-	if isDesc {
+	if descSort {
 		slices.SortFunc(segList, func(a, b int) int {
 			return cmp.Compare(b, a)
 		})
@@ -390,5 +398,92 @@ func (mgr *raftLogManager) lastLog(ctx *context.Context, onlyIdx bool) (*raft.En
 func (mgr *raftLogManager) firstLog(ctx *context.Context, onlyIdx bool) (*raft.Entry, error) {
 	mgr.mu.RLock()
 	defer mgr.mu.RUnlock()
+	if mgr.maxLogSeg > 0 {
+		segList, err := mgr.getSegList(false)
+		if err != nil {
+			return nil, err
+		}
+		w, err := openDiskListSegFile(mgr.dirPath, mgr.logName, segList[0])
+		if err != nil {
+			return nil, err
+		}
+		return w.first(onlyIdx)
+	}
+
 	return mgr.r.first(onlyIdx)
+}
+
+func (mgr *raftLogManager) truncate(ctx *context.Context, end uint64) error {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	segList, err := mgr.getSegList(true)
+	if err != nil {
+		return err
+	}
+	f := mgr.w
+	requireResetMainFile := false
+	i := 0
+	for {
+		requireRemove := false
+		firstEntry, err := f.first(true)
+		if err != nil {
+			return err
+		}
+		if firstEntry == nil {
+			break
+		}
+		if firstEntry.LogIndex > end {
+			err = f.truncate(0)
+			if err != nil {
+				return err
+			}
+			requireRemove = true
+		}
+		if firstEntry.LogIndex < end {
+			err = f.truncate(int(end - firstEntry.LogIndex))
+			if err != nil {
+				return err
+			}
+			if f != mgr.w {
+				err = f.close()
+				if err != nil {
+					return err
+				}
+			}
+			break
+		}
+		if requireRemove {
+			if mgr.w == f {
+				requireResetMainFile = true
+				err = mgr.r.close()
+				if err != nil {
+					return err
+				}
+				mgr.r = nil
+			}
+			err = f.Remove()
+			if err != nil {
+				return err
+			}
+		}
+		if i >= len(segList) {
+			break
+		}
+		f, err = openDiskListSegFile(mgr.dirPath, mgr.logName, segList[i])
+		if err != nil {
+			return err
+		}
+		i++
+	}
+	if requireResetMainFile {
+		err = segFileUp2MainFile(mgr.dirPath, mgr.logName, segList[i-1])
+		if err != nil {
+			return err
+		}
+		err = mgr.initFile()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

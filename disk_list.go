@@ -104,6 +104,22 @@ func openDiskListSegFile(dir, name string, segCount int) (*diskList, error) {
 	return s, nil
 }
 
+func segFileUp2MainFile(dir, name string, segCount int) error {
+	segIdxName := filepath.Join(dir, name+".idx.seg."+strconv.Itoa(segCount))
+	segDatName := filepath.Join(dir, name+".dat.seg."+strconv.Itoa(segCount))
+	mainIdxName := filepath.Join(dir, name+".idx")
+	mainDatName := filepath.Join(dir, name+".dat")
+	err := os.Rename(segIdxName, mainIdxName)
+	if err != nil {
+		return err
+	}
+	err = os.Rename(segDatName, mainDatName)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s *diskList) dataSize() (int64, error) {
 	if s.onlyAppend {
 		endOff, err := s.dat.Seek(0, io.SeekEnd)
@@ -355,12 +371,7 @@ func (s *diskList) batchRead(startOff, count int, onlyIdx bool) ([]*raft.Entry, 
 
 func (s *diskList) truncate(count int) error {
 	truncateSize := logDiskSize * count
-	fi, err := s.idx.Stat()
-	if err != nil {
-		return err
-	}
-	idxSize := fi.Size()
-	return s.idx.Truncate(idxSize - int64(truncateSize))
+	return s.idx.Truncate(int64(truncateSize))
 }
 
 func (s *diskList) readOff(idx int, onlyIdx bool) (*raft.Entry, error) {
