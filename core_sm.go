@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -384,7 +383,7 @@ func (s *CoreSm) insertLog(ctx *context.Context, typ raft.CommandType, dat []byt
 			Command:     dat,
 		},
 	}
-	_, endLogIndex, err := s.logMgr.appendLog(ctx, s.md.get().Term, entries)
+	_, endLogIndex, err := s.logMgr.leaderAppendLog(ctx, s.md.get().Term, entries)
 	if err != nil {
 		return err
 	}
@@ -502,7 +501,7 @@ func (s *CoreSm) insertCommands(ctx *context.Context, cq chan smCommandRes, comm
 			})
 		}
 		commands = commands[count:]
-		startLogIndex, endLogIndex, err := s.logMgr.appendLog(ctx, s.md.get().Term, entries)
+		startLogIndex, endLogIndex, err := s.logMgr.leaderAppendLog(ctx, s.md.get().Term, entries)
 		if err != nil {
 			return err
 		}
@@ -622,8 +621,10 @@ func (s *CoreSm) execLeaderHeartBeatFromLoop(ctx *context.Context, req *raft.App
 
 func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.AppendEntriesReq) (rsp *raft.AppendEntriesRsp, err error) {
 	slog.Info("leader append entries", slog.String("leader", req.LeaderId), slog.String("my", s.rpc.My))
-	rsp = new(raft.AppendEntriesRsp)
 	myTerm := s.md.get().Term
+	rsp = &raft.AppendEntriesRsp{
+		Term: myTerm,
+	}
 	if myTerm > req.Term {
 		err = emitErr(raft.ErrCode_ErrTermLtCurrent, slog.Uint64("req_term", req.Term), slog.Uint64("my_term", myTerm))
 		return
@@ -633,23 +634,110 @@ func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.Appen
 		S uint64
 		E uint64
 	}
-	scope := logCheckScope{
+	followerScope := logCheckScope{
 		S: indexVal.lastApplied,
 		E: indexVal.lastLogIndex,
 	}
-	// f_applied: 105
-	// f_log_list: 106~110
-	// l_log_prev_log: 107
-	// leader日志索引从follower有效索引范围中开始, 需要校验logTerm, 不一致的话follower需要truncate, leader需要回退
-	if scope.S < req.PrevLogIndex && req.PrevLogIndex < scope.E {
+	leaderScope := logCheckScope{
+		S: req.Entries[0].LogIndex,
+		E: req.Entries[len(req.Entries)-1].LogIndex,
+	}
+	if req.PrevLogIndex < followerScope.S {
+		// f_applied: 107
+		// f_log_list: 108~110
+		// l_log_prev: 105
+		rsp.ConflictIndex = followerScope.S
+		rsp.Success = false
+		return
+	} else if req.PrevLogIndex > followerScope.E {
+		// f_applied: 107
+		// f_log_list: 108~110
+		// l_log_prev: 120
+		rsp.ConflictIndex = followerScope.E
+		rsp.Term = indexVal.lastLogTerm
+		rsp.Success = false
+		return
+	} else if req.PrevLogIndex == followerScope.E {
+		// f_applied: 105
+		// f_log_list: 106~110
+		// l_log_prev_log: 110
+		// l_log_list: 111~120
+		if req.PrevLogTerm != indexVal.lastLogTerm {
+			rsp.ConflictIndex = req.PrevLogIndex
+			rsp.ConflictTerm = req.PrevLogTerm
+			rsp.Success = false
+			return rsp, nil
+		}
+		_, _, err = s.logMgr.followerAppendLog(ctx, req.Entries)
+		if err != nil {
+			return rsp, err
+		}
+	} else if followerScope.S <= req.PrevLogIndex && req.PrevLogIndex < followerScope.E {
+		// f_applied: 105
+		// f_log_list: 106~110
+		// l_log_prev_log: 107
+		// l_log_list: 108~120
+		// leader日志索引从follower有效索引范围中开始, 需要校验logTerm, 不一致的话follower需要truncate, leader需要回退
 		logEntry, err := s.logMgr.readLog(ctx, req.PrevLogIndex, false)
 		if err != nil {
-			return nil, err
+			return rsp, err
 		}
 		if logEntry.Term != req.PrevLogTerm {
-
+			err = s.logMgr.truncate(ctx, req.PrevLogIndex)
+			if err != nil {
+				return nil, err
+			}
+			rsp.ConflictIndex = req.PrevLogIndex
+			rsp.ConflictTerm = req.PrevLogTerm
+			rsp.Success = false
+			return rsp, nil
+		}
+		// 根据上述规则, leader这边的log 108~110需要和follower已有的比较, 如果term不一致则认为冲突, follower需要truncate并接受leader的日志
+		cmpIndexScope := logCheckScope{
+			S: req.Entries[0].LogIndex,
+		}
+		if leaderScope.E > followerScope.E {
+			cmpIndexScope.E = followerScope.E
+		} else {
+			cmpIndexScope.E = leaderScope.E
+		}
+		followerEntries, err := s.logMgr.readLogWithIndex(ctx, cmpIndexScope.S, cmpIndexScope.E, true)
+		if err != nil {
+			return rsp, err
+		}
+		matchEnd := 0
+		foundConfirm := false
+		for _, entry := range followerEntries {
+			if entry.Term != req.Entries[matchEnd].Term {
+				foundConfirm = true
+				err = s.logMgr.truncate(ctx, entry.LogIndex-1)
+				if err != nil {
+					return rsp, err
+				}
+				break
+			}
+			matchEnd++
+		}
+		afterEntries := req.Entries[matchEnd:]
+		if foundConfirm {
+			rsp.ConflictIndex = followerEntries[matchEnd].LogIndex
+			rsp.ConflictTerm = followerEntries[matchEnd].Term
+		}
+		if len(afterEntries) > 0 {
+			_, _, err = s.logMgr.followerAppendLog(ctx, afterEntries)
+			if err != nil {
+				return rsp, err
+			}
 		}
 	}
+	rsp.Success = true
+	indexVal = s.logMgr.getLogIndexVal(ctx)
+	s.logMgr.setCommitIndex(max(indexVal.lastCommitIndex, min(req.LeaderCommit, indexVal.lastLogIndex)))
+	s.aw.asyncApply(applyUserSmReq{
+		Ctx:      ctx.Clone(),
+		EndIndex: req.LeaderCommit,
+	})
+	return rsp, nil
 }
 
 func (s *CoreSm) execGetLeader(ctx *context.Context, req *raft.GetLeaderReq) (rsp *raft.GetLeaderRsp, err error) {

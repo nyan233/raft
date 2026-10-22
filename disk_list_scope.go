@@ -7,15 +7,15 @@ import (
 )
 
 type listScope3 struct {
-	m          *raftLogManager
+	rw         *diskListReaderWriter
 	startIndex uint64
 	endIndex   uint64
 	fileOff    []listScopeFileOff
 }
 
-func newListScope3(m *raftLogManager, startIndex, endIndex uint64) *listScope3 {
+func newListScope3(rw *diskListReaderWriter, startIndex, endIndex uint64) *listScope3 {
 	return &listScope3{
-		m:          m,
+		rw:         rw,
 		startIndex: startIndex,
 		endIndex:   endIndex,
 		fileOff:    make([]listScopeFileOff, 0, 8),
@@ -23,11 +23,11 @@ func newListScope3(m *raftLogManager, startIndex, endIndex uint64) *listScope3 {
 }
 
 func (s *listScope3) findStart() (foundStart bool, err error) {
-	firstEntry, err := s.m.r.first(true)
+	firstEntry, err := s.rw.r.first(true)
 	if err != nil {
 		return false, err
 	}
-	lastEntry, err := s.m.r.last(false)
+	lastEntry, err := s.rw.r.last(false)
 	if err != nil {
 		return false, err
 	}
@@ -48,16 +48,16 @@ func (s *listScope3) findStart() (foundStart bool, err error) {
 		return false
 	}
 	if firstEntry != nil {
-		if foundStart = appendFileOff(s.m.r, firstEntry, lastEntry); foundStart {
+		if foundStart = appendFileOff(s.rw.r, firstEntry, lastEntry); foundStart {
 			return
 		}
 	}
-	segList, err := s.m.getSegList(true)
+	segList, err := s.rw.getSegList(true)
 	if err != nil {
 		return false, err
 	}
 	for _, seg := range segList {
-		ls, err := openDiskListSegFile(s.m.dirPath, s.m.logName, seg)
+		ls, err := openDiskListSegFile(s.rw.dir, s.rw.name, seg)
 		if err != nil {
 			return false, err
 		}
@@ -88,7 +88,7 @@ func (s *listScope3) findEnd() error {
 				return fmt.Errorf("end index is out of range, end index is %d, last index is %d", s.endIndex, fileOff.last.LogIndex)
 			}
 			trimCount++
-			if fileOff.ls != s.m.r {
+			if fileOff.ls != s.rw.r {
 				err := fileOff.ls.close()
 				if err != nil {
 					return err
@@ -135,7 +135,7 @@ func (s *listScope3) rangeFor(fn func(f *diskList, startOff, count uint64) error
 
 func (s *listScope3) close() error {
 	for _, f := range s.fileOff {
-		if f.ls != s.m.r {
+		if f.ls != s.rw.r {
 			err := f.ls.close()
 			if err != nil {
 				return err

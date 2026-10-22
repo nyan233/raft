@@ -89,7 +89,7 @@ func (f *followerProgressWorker) doSync2Node() bool {
 	logMgr := f.csm.getLogMgr()
 	ctx := context.Background()
 	ctx.SetValue("Src", "follower-progress")
-	entries, err := logMgr.readLogWithIndex(ctx, startIndex, endIndex)
+	entries, err := logMgr.readLogWithIndex(ctx, startIndex, endIndex, false)
 	if err != nil {
 		slog.Error(err.Error())
 		return false
