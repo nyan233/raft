@@ -92,6 +92,9 @@ func (mgr *raftLogManager) cleanLogSeg() {
 	if err != nil {
 		return
 	}
+	if lastApplied <= 0 {
+		return
+	}
 	// NOTE 2026/10/16 保留最后一条日志, 用于AppendEntries日志检查
 	cleanEnd := lastApplied - 1
 	err = mgr.lrw.cleanWithLogIndex(cleanEnd)

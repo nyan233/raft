@@ -17,27 +17,29 @@ import (
 )
 
 const (
-	logDiskSize     = 4 + 8*4 + 4
+	logDiskSize     = 4*2 + 8*4 + 4
 	fileDataSizeMax = 1024 * 1024 * 1024
 )
 
 type diskListItem struct {
 	idxCheckSum  uint32
+	cmdType      uint32
 	logIndex     uint64
 	logTerm      uint64
 	dataSize     uint64
 	dataOffset   uint64
 	dataCheckSum uint32
-	readData     []byte
+	cmdData      []byte
 }
 
 func (d *diskListItem) checkSum(buf *[]byte) {
 	checkSumBuf := *buf
 	binary.BigEndian.PutUint64(checkSumBuf[:8], d.logIndex)
 	binary.BigEndian.PutUint64(checkSumBuf[8:], d.logTerm)
-	binary.BigEndian.PutUint64(checkSumBuf[16:], d.dataSize)
-	binary.BigEndian.PutUint64(checkSumBuf[24:], d.dataOffset)
-	binary.BigEndian.PutUint32(checkSumBuf[32:], d.dataCheckSum)
+	binary.BigEndian.PutUint32(checkSumBuf[16:], d.cmdType)
+	binary.BigEndian.PutUint64(checkSumBuf[20:], d.dataSize)
+	binary.BigEndian.PutUint64(checkSumBuf[28:], d.dataOffset)
+	binary.BigEndian.PutUint32(checkSumBuf[36:], d.dataCheckSum)
 	checkSum := crc32.ChecksumIEEE(checkSumBuf)
 	d.idxCheckSum = checkSum
 }
@@ -46,6 +48,7 @@ func (d *diskListItem) writeToBuf(buf *[]byte) {
 	*buf = binary.BigEndian.AppendUint32(*buf, d.idxCheckSum)
 	*buf = binary.BigEndian.AppendUint64(*buf, d.logIndex)
 	*buf = binary.BigEndian.AppendUint64(*buf, d.logTerm)
+	*buf = binary.BigEndian.AppendUint32(*buf, d.cmdType)
 	*buf = binary.BigEndian.AppendUint64(*buf, d.dataSize)
 	*buf = binary.BigEndian.AppendUint64(*buf, d.dataOffset)
 	*buf = binary.BigEndian.AppendUint32(*buf, d.dataCheckSum)
@@ -58,9 +61,10 @@ func (d *diskListItem) parse(buf []byte) error {
 	d.idxCheckSum = binary.BigEndian.Uint32(buf[:4])
 	d.logIndex = binary.BigEndian.Uint64(buf[4:])
 	d.logTerm = binary.BigEndian.Uint64(buf[12:])
-	d.dataSize = binary.BigEndian.Uint64(buf[20:])
-	d.dataOffset = binary.BigEndian.Uint64(buf[28:])
-	d.dataCheckSum = binary.BigEndian.Uint32(buf[36:])
+	d.cmdType = binary.BigEndian.Uint32(buf[20:])
+	d.dataSize = binary.BigEndian.Uint64(buf[24:])
+	d.dataOffset = binary.BigEndian.Uint64(buf[32:])
+	d.dataCheckSum = binary.BigEndian.Uint32(buf[40:])
 	return nil
 }
 
@@ -216,6 +220,7 @@ func (s *diskList) write(entries []*raft.Entry) error {
 		idxEntries = append(idxEntries, &diskListItem{
 			logIndex:     entry.LogIndex,
 			logTerm:      entry.Term,
+			cmdType:      entry.CommandType,
 			dataCheckSum: crc32.ChecksumIEEE(entry.Command),
 			dataOffset:   uint64(endSeek),
 			dataSize:     uint64(len(entry.Command)),
@@ -274,6 +279,13 @@ func (s *diskList) last(onlyIdx bool) (*raft.Entry, error) {
 }
 
 func (s *diskList) batchRead(startOff, count int, onlyIdx bool) ([]*raft.Entry, error) {
+	if count == 1 {
+		entry, err := s.readOff(startOff, onlyIdx)
+		if err != nil {
+			return nil, err
+		}
+		return []*raft.Entry{entry}, nil
+	}
 	var (
 		offset      = startOff * logDiskSize
 		buf         = make([]byte, logDiskSize*count)
@@ -304,72 +316,68 @@ func (s *diskList) batchRead(startOff, count int, onlyIdx bool) ([]*raft.Entry, 
 		}
 		logDiskList = append(logDiskList, &d)
 		entries = append(entries, &raft.Entry{
-			Term:     d.logTerm,
-			LogIndex: d.logIndex,
+			Term:        d.logTerm,
+			LogIndex:    d.logIndex,
+			CommandType: d.cmdType,
 		})
 		buf = buf[logDiskSize:]
 	}
 	if onlyIdx {
 		return entries, nil
 	}
-	firstLogDisk := logDiskList[0]
-	if len(entries) == 1 {
-		entry := entries[0]
-		buf = make([]byte, firstLogDisk.dataSize)
-		_, err = s.dat.ReadAt(buf, int64(firstLogDisk.dataOffset))
-		if err != nil {
-			return nil, err
-		}
-		if crc32.ChecksumIEEE(buf) != firstLogDisk.dataCheckSum {
-			err = fmt.Errorf("read dat checksum not equal %d", firstLogDisk.dataCheckSum)
-			return nil, err
-		}
-		entry.Command = buf
+	// 分组读取
+	type readGroup struct {
+		s    uint64
+		size uint64
+		d    []*diskListItem
+		buf  []byte
 	}
-	batchStart := firstLogDisk.dataOffset
-	batchEnd := firstLogDisk.dataOffset + firstLogDisk.dataSize
-	startParse := 0
-	dataBuf := make([]byte, 0, 1024)
-	batchReadFn := func(currentIndex int) error {
-		dataBufSize := batchEnd - batchStart
-		if uint64(cap(dataBuf)) < dataBufSize {
-			dataBuf = make([]byte, 0, dataBufSize)
-		}
-		dataBuf = dataBuf[:dataBufSize]
-		readCount, err = s.dat.ReadAt(dataBuf, int64(batchStart))
-		if err != nil {
-			return err
-		}
-		for k, v := range logDiskList[startParse : currentIndex+1] {
-			commandData := dataBuf[:v.dataSize]
-			if crc32.ChecksumIEEE(commandData) != v.dataCheckSum {
-				err = fmt.Errorf("read dat checksum not equal %d", v.dataCheckSum)
-				return err
-			}
-			entry := entries[k]
-			entry.Command = append(entry.Command, commandData...)
-			dataBuf = dataBuf[v.dataSize:]
-		}
-		return nil
-	}
-	for i := 1; i < len(logDiskList); i++ {
-		d := logDiskList[i]
-		if d.dataOffset == batchEnd {
-			batchEnd += d.dataSize
+	groups := make([]*readGroup, 0, 4)
+	for _, item := range logDiskList {
+		if len(groups) == 0 {
+			groups = append(groups, &readGroup{
+				s:    item.dataOffset,
+				size: item.dataSize,
+				d:    []*diskListItem{item},
+			})
 		} else {
-			if err = batchReadFn(i); err != nil {
+			lastGroup := groups[len(groups)-1]
+			if item.dataOffset == lastGroup.s+lastGroup.size {
+				lastGroup.size += item.dataSize
+				lastGroup.d = append(lastGroup.d, item)
+			} else {
+				groups = append(groups, &readGroup{
+					s:    item.dataOffset,
+					size: item.dataSize,
+					d:    []*diskListItem{item},
+				})
+			}
+		}
+	}
+	for _, group := range groups {
+		group.buf = make([]byte, group.size)
+		readCount, err = s.dat.ReadAt(group.buf, int64(group.s))
+		if err != nil {
+			return nil, err
+		}
+		if readCount != int(group.size) {
+			err = fmt.Errorf("read count not equal %d", readCount)
+			return nil, err
+		}
+		for _, d := range group.d {
+			myStart := d.dataOffset - group.s
+			end := myStart + d.dataSize
+			myBuf := group.buf[myStart:end:end]
+			dataCk := crc32.ChecksumIEEE(myBuf)
+			if dataCk != d.dataCheckSum {
+				err = fmt.Errorf("read dat checksum not equal %d", d.dataCheckSum)
 				return nil, err
 			}
-			batchStart = d.dataOffset
-			batchEnd = d.dataOffset + d.dataSize
-			startParse = i
+			d.cmdData = myBuf
 		}
-		// 兜一下底
-		if startParse == len(logDiskList)-1 || i == len(logDiskList)-1 {
-			if err = batchReadFn(i); err != nil {
-				return nil, err
-			}
-		}
+	}
+	for idx, d := range logDiskList {
+		entries[idx].Command = d.cmdData
 	}
 	return entries, nil
 }
@@ -386,16 +394,12 @@ func (s *diskList) readOff(idx int, onlyIdx bool) (*raft.Entry, error) {
 		d   diskListItem
 	)
 	readCount, err := s.idx.ReadAt(buf, int64(off))
-	if err == io.EOF {
-		return nil, nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
 	if readCount == 0 {
 		return nil, nil
-	}
-	if readCount != len(buf) {
+	} else if readCount != len(buf) {
 		err = fmt.Errorf("read count not equal %d", readCount)
 		return nil, err
 	}
@@ -410,9 +414,10 @@ func (s *diskList) readOff(idx int, onlyIdx bool) (*raft.Entry, error) {
 	}
 	if onlyIdx {
 		return &raft.Entry{
-			Term:     d.logTerm,
-			LogIndex: d.logIndex,
-			Command:  nil,
+			Term:        d.logTerm,
+			LogIndex:    d.logIndex,
+			CommandType: d.cmdType,
+			Command:     nil,
 		}, nil
 	}
 	dataBuf := make([]byte, d.dataSize)
@@ -430,9 +435,10 @@ func (s *diskList) readOff(idx int, onlyIdx bool) (*raft.Entry, error) {
 		return nil, err
 	}
 	e := &raft.Entry{
-		LogIndex: d.logIndex,
-		Term:     d.logTerm,
-		Command:  dataBuf,
+		LogIndex:    d.logIndex,
+		Term:        d.logTerm,
+		CommandType: d.cmdType,
+		Command:     dataBuf,
 	}
 	return e, nil
 }
@@ -622,6 +628,9 @@ func (d *diskListReaderWriter) truncateWithLogIndex(end uint64) error {
 	if err != nil {
 		return err
 	}
+	if lastEntry == nil {
+		return nil
+	}
 	if lastEntry.LogIndex < end {
 		return errors.New("endIndex out of range")
 	}
@@ -664,19 +673,24 @@ func (d *diskListReaderWriter) truncateWithLogIndex(end uint64) error {
 		}
 	}
 	allFile = allFile[removeIdx+1:]
-	if removeIdx >= 0 {
-		if len(allFile) > 0 {
-			err := segFileUp2MainFile(d.dir, d.name, allFile[0].seg)
-			if err != nil {
-				return err
-			}
-		}
-		err := d.initFile()
+	if len(allFile) == 0 {
+		// 一个都不剩了, 重新init文件吧
+		d.segFileList = nil
+		err = d.initFile()
 		if err != nil {
 			return err
 		}
-		if removeIdx > 0 {
-			d.segFileList = d.segFileList[removeIdx:]
+	} else if removeIdx >= 0 {
+		err = segFileUp2MainFile(d.dir, d.name, allFile[0].seg)
+		if err != nil {
+			return err
+		}
+		if len(d.segFileList) > 0 {
+			d.segFileList = d.segFileList[removeIdx+1:]
+		}
+		err = d.initFile()
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -741,6 +755,9 @@ func (d *diskListReaderWriter) last(onlyIdx bool) (*raft.Entry, error) {
 	}
 	if entry != nil {
 		return entry, nil
+	}
+	if len(d.segFileList) == 0 {
+		return nil, nil
 	}
 	return d.segFileList[0].r.last(onlyIdx)
 }
