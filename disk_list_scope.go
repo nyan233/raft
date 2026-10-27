@@ -52,26 +52,22 @@ func (s *listScope3) findStart() (foundStart bool, err error) {
 			return
 		}
 	}
-	segList, err := s.rw.getSegList(true)
-	if err != nil {
-		return false, err
-	}
-	for _, seg := range segList {
-		ls, err := openDiskListSegFile(s.rw.dir, s.rw.name, seg)
+	err = s.rw.RangeSegFile(func(f *diskList) (bool, error) {
+		firstEntry, err = f.first(false)
 		if err != nil {
 			return false, err
 		}
-		firstEntry, err = ls.first(false)
+		lastEntry, err = f.last(false)
 		if err != nil {
 			return false, err
 		}
-		lastEntry, err = ls.last(false)
-		if err != nil {
-			return false, err
-		}
-		if appendFileOff(ls, firstEntry, lastEntry) {
+		if appendFileOff(f, firstEntry, lastEntry) {
 			return true, nil
 		}
+		return false, nil
+	})
+	if err != nil {
+		return false, err
 	}
 	return false, nil
 }
@@ -85,15 +81,9 @@ func (s *listScope3) findEnd() error {
 		} else {
 			// 超过当前文件的有的索引范围
 			if i == 0 && s.endIndex > fileOff.last.LogIndex {
-				return fmt.Errorf("end index is out of range, end index is %d, last index is %d", s.endIndex, fileOff.last.LogIndex)
+				return fmt.Errorf("end index is out of range, end index is %d, Last index is %d", s.endIndex, fileOff.last.LogIndex)
 			}
 			trimCount++
-			if fileOff.ls != s.rw.r {
-				err := fileOff.ls.close()
-				if err != nil {
-					return err
-				}
-			}
 		}
 	}
 	s.fileOff = s.fileOff[trimCount:]
@@ -101,45 +91,57 @@ func (s *listScope3) findEnd() error {
 	return nil
 }
 
-func (s *listScope3) find() error {
+func (s *listScope3) Find() error {
 	if s.startIndex > s.endIndex {
 		return fmt.Errorf("start index is out of range, end index is %d", s.endIndex)
 	}
 	foundStart, err := s.findStart()
 	if err != nil {
-		s.close()
 		return err
 	}
 	if !foundStart {
-		s.close()
 		return fmt.Errorf("unknown file offset, startIndex=%d, endIndex=%d", s.startIndex, s.endIndex)
 	}
 	err = s.findEnd()
 	if err != nil {
-		s.close()
 		return err
 	}
 	return nil
 }
 
-func (s *listScope3) rangeFor(fn func(f *diskList, startOff, count uint64) error) error {
+func (s *listScope3) ReadAll(onlyIdx bool) ([]*raft.Entry, error) {
+	var (
+		err        error
+		entriesBuf = make([]*raft.Entry, 0, 64)
+	)
+	if len(s.fileOff) == 0 {
+		err = s.Find()
+		if err != nil {
+			return nil, err
+		}
+	}
+	err = s.RangeFor(func(f *diskList, startOff, count uint64) error {
+		entries, err := f.batchRead(int(startOff), int(count), onlyIdx)
+		if err != nil {
+			return err
+		}
+		if len(entries) > 0 {
+			entriesBuf = append(entriesBuf, entries...)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entriesBuf, nil
+}
+
+func (s *listScope3) RangeFor(fn func(f *diskList, startOff, count uint64) error) error {
 	for i := len(s.fileOff) - 1; i >= 0; i-- {
 		ff := s.fileOff[i]
 		err := fn(ff.ls, ff.startOff, (ff.endOff-ff.startOff)+1)
 		if err != nil {
 			return err
-		}
-	}
-	return nil
-}
-
-func (s *listScope3) close() error {
-	for _, f := range s.fileOff {
-		if f.ls != s.rw.r {
-			err := f.ls.close()
-			if err != nil {
-				return err
-			}
 		}
 	}
 	return nil

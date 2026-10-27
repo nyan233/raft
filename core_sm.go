@@ -1,14 +1,18 @@
 package raft
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math/rand"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 	"time"
 
+	"github.com/nyan233/littlerpc/core/client"
 	"github.com/nyan233/littlerpc/core/common/context"
+	"github.com/nyan233/littlerpc/core/server"
 	"github.com/nyan233/raft/pb/message/raft"
 	"google.golang.org/protobuf/proto"
 )
@@ -27,6 +31,7 @@ const (
 	smCommandRemoveServer
 	smCommandMatchIndexChangeEv
 	smCommandApplyUserSmCb
+	smCommandTermLtEv
 )
 
 const (
@@ -45,6 +50,19 @@ type holdAppendCommandsReq struct {
 type smCommandRes struct {
 	Rsp proto.Message
 	Err error
+}
+
+type asyncVoteRes struct {
+	ReqCount  int
+	VoteCount uint64
+	IsTimeout bool
+}
+
+type asyncAppendEntriesRes struct {
+	ReqCount     int
+	SuccessCount int
+	MemberErr    map[string]error
+	Req          *raft.AppendEntriesReq
 }
 
 type smCommand struct {
@@ -70,12 +88,13 @@ type CoreSm struct {
 	heartbeatTicker     *time.Ticker
 	lastLeaderHeartBeat time.Time
 	logMgr              *raftLogManager
-	rpc                 *coreRpc
 	md                  *meta
 	tt                  *timeoutTicker
 	pw                  *leaderProgressWorker
 	aw                  *applyWorker
 	holdList            []*holdAppendCommandsReq
+	mm                  *memberManager
+	rpcCli              raft.RaftProxy
 }
 
 func NewCoreSm(cfg CoreSmConfig) *CoreSm {
@@ -93,12 +112,16 @@ func (s *CoreSm) Init() error {
 	if err != nil {
 		return err
 	}
-	s.rpc, err = newCoreRpc(s, s.cfg.My, s.cfg.Membership)
+	err = s.initMember()
+	if err != nil {
+		return err
+	}
+	err = s.initRpc()
 	if err != nil {
 		return err
 	}
 	s.logMgr = newRaftLogManager(s.cfg.LogDir, s.cfg.LogName, s.cfg.UserSmFactory())
-	err = s.logMgr.init()
+	err = s.logMgr.Init()
 	if err != nil {
 		return err
 	}
@@ -109,12 +132,40 @@ func (s *CoreSm) Init() error {
 	return nil
 }
 
+func (s *CoreSm) initMember() error {
+	s.mm = new(memberManager)
+	s.mm.intiMember(s.cfg.My, s.cfg.Membership)
+	return nil
+}
+
+func (s *CoreSm) initRpc() error {
+	rpcClient, err := client.New(
+		client.WithCodec("protobuf"),
+		//client.WithMuxWriter(),
+		//client.WithNsStorage(ns.NewFixedStorage([]string{})),
+	)
+	if err != nil {
+		return err
+	}
+	s.rpcCli = raft.NewRaft(rpcClient)
+	rpcServer := server.New(
+		server.WithAddressServer(s.mm.getMy()),
+		server.WithDefaultServer(),
+	)
+	err = raft.RegisterRaftServer(rpcServer, &coreSmRpc{csm: s}, nil)
+	if err != nil {
+		return err
+	}
+	go rpcServer.Service()
+	return nil
+}
+
 func (s *CoreSm) getLogMgr() *raftLogManager {
 	return s.logMgr
 }
 
 func (s *CoreSm) myIsLeader() bool {
-	return s.state == raft.State_StateLeader && s.rpc.My == s.rpc.Leader
+	return s.state == raft.State_StateLeader
 }
 
 func (s *CoreSm) startTimeoutTicker() {
@@ -196,16 +247,14 @@ func (s *CoreSm) startLoop() {
 					}
 					break
 				}
-				indexVal := s.logMgr.getLogIndexVal(cmd.ctx)
-				s.rpc.asyncAppendEntries(cmd.ctx, &raft.AppendEntriesReq{
+				indexVal := s.logMgr.GetLogIndexVal(cmd.ctx)
+				s.asyncHeartBeat(cmd.ctx, &raft.AppendEntriesReq{
 					Term:         s.md.get().Term,
-					LeaderId:     s.rpc.My,
+					LeaderId:     s.mm.getMy(),
 					PrevLogIndex: indexVal.lastLogIndex,
 					PrevLogTerm:  indexVal.lastLogTerm,
 					Entries:      nil,
 					LeaderCommit: indexVal.lastCommitIndex,
-				}, func(ctx *context.Context, res *asyncAppendEntriesRes) {
-					return
 				})
 				cmd.cq <- smCommandRes{
 					Rsp: nil,
@@ -236,7 +285,7 @@ func (s *CoreSm) startLoop() {
 			case smCommandInsertNoOp:
 				err := s.insertNoOp(cmd.ctx)
 				if err != nil {
-					slog.Error("insert noop", slog.String("err", err.Error()), slog.String("my", s.rpc.My))
+					slog.Error("insert noop", slog.String("err", err.Error()), slog.String("my", s.mm.getMy()))
 				}
 			case smCommandAddServer:
 				rsp, err := s.execAddServerFromLoop(cmd.ctx, cmd.req.(*raft.AddServerReq))
@@ -254,6 +303,8 @@ func (s *CoreSm) startLoop() {
 				s.handleApply2UserSmCb(cmd.anyReq.(applyUserSmCb))
 			case smCommandMatchIndexChangeEv:
 				s.handleMatchIndexChange(cmd.anyReq.(leaderMatchIndexChangeEv))
+			case smCommandTermLtEv:
+				s.handleTermLtEv(cmd.anyReq.(termLtEv))
 			}
 		}
 	}
@@ -278,8 +329,8 @@ func (s *CoreSm) handleCandidateTimeout(cmd smCommand) {
 		if err != nil {
 			slog.Error("request vote rpc",
 				slog.String("err", err.Error()),
-				slog.String("my", s.rpc.My),
-				slog.String("member", fmt.Sprintf("%v", s.rpc.Membership)),
+				slog.String("my", s.mm.getMy()),
+				slog.String("member", fmt.Sprintf("%v", s.mm.getList())),
 			)
 		}
 	}
@@ -294,17 +345,20 @@ func (s *CoreSm) execAddServerFromLoop(ctx *context.Context, req *raft.AddServer
 	if s.state != raft.State_StateLeader {
 		err = emitErr(raft.ErrCode_ErrNoLeader,
 			slog.Int("state", int(s.state)),
-			slog.String("my", s.rpc.My),
+			slog.String("my", s.mm.getMy()),
 		)
 		return
 	}
-	if req.NewServer == s.rpc.My || slices.Contains(s.rpc.Membership, req.NewServer) {
+	memberList := s.mm.getList()
+	my := s.mm.getMy()
+	if req.NewServer == my || slices.Contains(memberList, req.NewServer) {
 		err = emitErr(raft.ErrCode_ErrChangeServerExists)
 		return
 	}
-	oldMemberList := append([]string{s.rpc.My}, s.rpc.Membership...)
-	newMemberList := append(oldMemberList, req.NewServer)
-	err = s.insertMemberChange(ctx, oldMemberList, newMemberList)
+	// TODO 完整的AddServer实现
+	s.mm.append(req.NewServer)
+	newMemberList := s.mm.getList()
+	err = s.insertMemberChange(ctx, memberList, newMemberList)
 	if err != nil {
 		return
 	}
@@ -316,28 +370,24 @@ func (s *CoreSm) execRemoveServerFromLoop(ctx *context.Context, req *raft.Remove
 	if s.state != raft.State_StateLeader {
 		err = emitErr(raft.ErrCode_ErrNoLeader,
 			slog.Int("state", int(s.state)),
-			slog.String("my", s.rpc.My),
+			slog.String("my", s.mm.getMy()),
 		)
 		return
 	}
-	if req.OldServer != s.rpc.My && !slices.Contains(s.rpc.Membership, req.OldServer) {
+	memberList := s.mm.getList()
+	my := s.mm.getMy()
+	if req.OldServer != my && !slices.Contains(memberList, req.OldServer) {
 		err = emitErr(raft.ErrCode_ErrChangeServerNotFound)
 		return
 	}
 	// TODO 移除自身
-	if req.OldServer == s.rpc.My {
+	if req.OldServer == my {
 		err = fmt.Errorf("not support remove leader")
 		return
 	}
-	oldMemberList := append([]string{s.rpc.My}, s.rpc.Membership...)
-	newMemberList := append([]string(nil), oldMemberList...)
-	newMemberList = slices.DeleteFunc(newMemberList, func(s string) bool {
-		if s == req.OldServer {
-			return true
-		}
-		return false
-	})
-	err = s.insertMemberChange(ctx, oldMemberList, newMemberList)
+	s.mm.remove(req.OldServer)
+	newMemberList := s.mm.getList()
+	err = s.insertMemberChange(ctx, memberList, newMemberList)
 	if err != nil {
 		return
 	}
@@ -355,7 +405,7 @@ func (s *CoreSm) execRemoveServerFromLoop(ctx *context.Context, req *raft.Remove
 //
 //	}
 //	if len(anyReq.Req.Entries) > 0 {
-//		s.logMgr.setCommitIndex(anyReq.Req.PrevLogIndex + uint64(len(anyReq.Req.Entries)))
+//		s.logMgr.SetCommitIndex(anyReq.Req.PrevLogIndex + uint64(len(anyReq.Req.Entries)))
 //	}
 //	return rsp, err
 //}
@@ -383,7 +433,7 @@ func (s *CoreSm) insertLog(ctx *context.Context, typ raft.CommandType, dat []byt
 			Command:     dat,
 		},
 	}
-	_, endLogIndex, err := s.logMgr.leaderAppendLog(ctx, s.md.get().Term, entries)
+	_, endLogIndex, err := s.logMgr.LeaderAppendLog(ctx, s.md.get().Term, entries)
 	if err != nil {
 		return err
 	}
@@ -408,30 +458,41 @@ func (s *CoreSm) execCommandAsyncRequestVoteCompFromLoop(ctx *context.Context, r
 	if s.state != raft.State_StateCandidate {
 		return nil
 	}
-	minVote := len(s.rpc.Membership)/2 + 1
-	if res.VoteCount >= uint64(minVote) {
+	//minVote := len(s.rpc.Membership)/2 + 1
+	//if res.VoteCount >= uint64(minVote) {
+	//	s.state = raft.State_StateLeader
+	//	s.rpc.Leader = s.rpc.My
+	//	slog.Info("my is leader, call broadcastAppendEntries2AllMemberShip", slog.String("my", s.rpc.My))
+	//	indexVal := s.logMgr.GetLogIndexVal(ctx)
+	//	s.rpc.asyncAppendEntries(ctx, &raft.AppendEntriesReq{
+	//		Term:         s.md.get().Term,
+	//		LeaderId:     s.rpc.My,
+	//		PrevLogIndex: indexVal.lastLogIndex,
+	//		PrevLogTerm:  indexVal.lastLogTerm,
+	//		Entries:      nil,
+	//		LeaderCommit: indexVal.lastCommitIndex,
+	//	}, func(ctx *context.Context, res *asyncAppendEntriesRes) {
+	//		s.createAndStartProgressWorker()
+	//		// 插入no-op日志
+	//		s.q <- smCommand{
+	//			typ:    smCommandInsertNoOp,
+	//			ctx:    ctx,
+	//			anyReq: res,
+	//		}
+	//		return
+	//	})
+	//
+	//}
+	// NOTE: 插入no-op后会自动管理复制进度, 不需要在此处手动发心跳
+	if res.VoteCount >= uint64(s.mm.quorum()) {
 		s.state = raft.State_StateLeader
-		s.rpc.Leader = s.rpc.My
-		slog.Info("my is leader, call broadcastAppendEntries2AllMemberShip", slog.String("my", s.rpc.My))
-		indexVal := s.logMgr.getLogIndexVal(ctx)
-		s.rpc.asyncAppendEntries(ctx, &raft.AppendEntriesReq{
-			Term:         s.md.get().Term,
-			LeaderId:     s.rpc.My,
-			PrevLogIndex: indexVal.lastLogIndex,
-			PrevLogTerm:  indexVal.lastLogTerm,
-			Entries:      nil,
-			LeaderCommit: indexVal.lastCommitIndex,
-		}, func(ctx *context.Context, res *asyncAppendEntriesRes) {
-			s.createAndStartProgressWorker()
-			// 插入no-op日志
-			s.q <- smCommand{
-				typ:    smCommandInsertNoOp,
-				ctx:    ctx,
-				anyReq: res,
-			}
-			return
-		})
-
+		s.createAndStartProgressWorker()
+		// 插入no-op日志
+		s.q <- smCommand{
+			typ:    smCommandInsertNoOp,
+			ctx:    ctx,
+			anyReq: res,
+		}
 	}
 	return nil
 }
@@ -439,8 +500,8 @@ func (s *CoreSm) execCommandAsyncRequestVoteCompFromLoop(ctx *context.Context, r
 func (s *CoreSm) createAndStartProgressWorker() {
 	s.pw = newLeaderProgressWorker(s)
 	s.pw.run()
-	for _, member := range s.rpc.Membership {
-		s.pw.addFollower(member, member, s.rpc.Leader)
+	for _, member := range s.mm.getList() {
+		s.pw.addFollower(member, member, s.mm.getMy())
 	}
 }
 
@@ -452,23 +513,23 @@ func (s *CoreSm) enterCandidate() error {
 	}
 	ctx := context.Background()
 	err = s.md.save(metaData{
-		VoteFor: s.rpc.My,
+		VoteFor: s.mm.getMy(),
 		Term:    s.md.get().Term,
 	})
 	if err != nil {
 		return err
 	}
-	indexVal := s.logMgr.getLogIndexVal(ctx)
+	indexVal := s.logMgr.GetLogIndexVal(ctx)
 	req := &raft.RequestVoteReq{
 		Term:         s.md.get().Term,
-		CandiDateId:  s.rpc.My,
+		CandiDateId:  s.mm.getMy(),
 		LastLogIndex: indexVal.lastLogIndex,
 		LastLogTerm:  indexVal.lastLogTerm,
 	}
-	s.rpc.asyncRequestVote(ctx, req, func(ctx *context.Context, res *asyncVoteRes) {
+	s.asyncRequestVote(ctx, req, func(ctx *context.Context, res *asyncVoteRes) {
 		s.q <- smCommand{
 			typ:    smCommandAsyncRequestVoteComp,
-			ctx:    context.Background(),
+			ctx:    ctx,
 			anyReq: res,
 		}
 	})
@@ -480,7 +541,7 @@ func (s *CoreSm) insertCommands(ctx *context.Context, cq chan smCommandRes, comm
 	if !s.myIsLeader() {
 		return emitErr(raft.ErrCode_ErrNoLeader,
 			slog.Int("state", int(s.state)),
-			slog.String("my", s.rpc.My),
+			slog.String("my", s.mm.getMy()),
 		)
 	}
 	holdReq := &holdAppendCommandsReq{
@@ -501,7 +562,7 @@ func (s *CoreSm) insertCommands(ctx *context.Context, cq chan smCommandRes, comm
 			})
 		}
 		commands = commands[count:]
-		startLogIndex, endLogIndex, err := s.logMgr.leaderAppendLog(ctx, s.md.get().Term, entries)
+		startLogIndex, endLogIndex, err := s.logMgr.LeaderAppendLog(ctx, s.md.get().Term, entries)
 		if err != nil {
 			return err
 		}
@@ -524,15 +585,19 @@ func (s *CoreSm) execAppendCommandsFromLoop(ctx *context.Context, req *raft.Appe
 }
 
 func (s *CoreSm) execGetLeaderFromLoop(ctx *context.Context, req *raft.GetLeaderReq) (rsp *raft.GetLeaderRsp, err error) {
+	if s.state != raft.State_StateLeader {
+		err = emitErr(raft.ErrCode_ErrNoLeader, s.mm.getMy())
+		return
+	}
 	rsp = &raft.GetLeaderRsp{
-		LeaderId: s.rpc.Leader,
-		LeaderIp: s.rpc.Leader,
+		LeaderId: s.mm.getMy(),
+		LeaderIp: s.mm.getMy(),
 	}
 	return rsp, nil
 }
 
 func (s *CoreSm) execRequestVoteFromLoop(ctx *context.Context, req *raft.RequestVoteReq) (rsp *raft.RequestVoteRsp, err error) {
-	if s.rpc.My == req.CandiDateId {
+	if s.mm.getMy() == req.CandiDateId {
 		err = emitErr(raft.ErrCode_ErrInvalidRequest, "vote request")
 		return
 	}
@@ -557,7 +622,7 @@ func (s *CoreSm) execRequestVoteFromLoop(ctx *context.Context, req *raft.Request
 			return rsp, nil
 		}
 	}
-	indexVal := s.logMgr.getLogIndexVal(ctx)
+	indexVal := s.logMgr.GetLogIndexVal(ctx)
 	md.Term = req.Term
 	rsp.Term = md.Term
 	// 必须执行日志新旧检查
@@ -596,10 +661,10 @@ func (s *CoreSm) execLeaderHeartBeatFromLoop(ctx *context.Context, req *raft.App
 		return
 	}
 	s.lastLeaderHeartBeat = time.Now()
-	s.rpc.Leader = req.LeaderId
+	s.mm.setLeader(req.LeaderId)
 	rsp.Term = s.md.get().Term
 
-	indexVal := s.logMgr.getLogIndexVal(ctx)
+	indexVal := s.logMgr.GetLogIndexVal(ctx)
 	// 索引比follower持有得多, leader通常需要回退索引
 	if req.PrevLogIndex > indexVal.lastLogIndex {
 		rsp.Success = false
@@ -620,7 +685,7 @@ func (s *CoreSm) execLeaderHeartBeatFromLoop(ctx *context.Context, req *raft.App
 }
 
 func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.AppendEntriesReq) (rsp *raft.AppendEntriesRsp, err error) {
-	slog.Info("leader append entries", slog.String("leader", req.LeaderId), slog.String("my", s.rpc.My))
+	slog.Info("leader append entries", slog.String("leader", req.LeaderId), slog.String("my", s.mm.getMy()))
 	myTerm := s.md.get().Term
 	rsp = &raft.AppendEntriesRsp{
 		Term: myTerm,
@@ -629,7 +694,7 @@ func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.Appen
 		err = emitErr(raft.ErrCode_ErrTermLtCurrent, slog.Uint64("req_term", req.Term), slog.Uint64("my_term", myTerm))
 		return
 	}
-	indexVal := s.logMgr.getLogIndexVal(ctx)
+	indexVal := s.logMgr.GetLogIndexVal(ctx)
 	type logCheckScope struct {
 		S uint64
 		E uint64
@@ -668,7 +733,7 @@ func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.Appen
 			rsp.Success = false
 			return rsp, nil
 		}
-		_, _, err = s.logMgr.followerAppendLog(ctx, req.Entries)
+		_, _, err = s.logMgr.FollowerAppendLog(ctx, req.Entries)
 		if err != nil {
 			return rsp, err
 		}
@@ -678,12 +743,12 @@ func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.Appen
 		// l_log_prev_log: 107
 		// l_log_list: 108~120
 		// leader日志索引从follower有效索引范围中开始, 需要校验logTerm, 不一致的话follower需要truncate, leader需要回退
-		logEntry, err := s.logMgr.readLog(ctx, req.PrevLogIndex, false)
+		logEntry, err := s.logMgr.ReadLog(ctx, req.PrevLogIndex, false)
 		if err != nil {
 			return rsp, err
 		}
 		if logEntry.Term != req.PrevLogTerm {
-			err = s.logMgr.truncate(ctx, req.PrevLogIndex)
+			err = s.logMgr.Truncate(ctx, req.PrevLogIndex)
 			if err != nil {
 				return nil, err
 			}
@@ -701,7 +766,7 @@ func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.Appen
 		} else {
 			cmpIndexScope.E = leaderScope.E
 		}
-		followerEntries, err := s.logMgr.readLogWithIndex(ctx, cmpIndexScope.S, cmpIndexScope.E, true)
+		followerEntries, err := s.logMgr.ReadLogWithIndex(ctx, cmpIndexScope.S, cmpIndexScope.E, true)
 		if err != nil {
 			return rsp, err
 		}
@@ -710,7 +775,7 @@ func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.Appen
 		for _, entry := range followerEntries {
 			if entry.Term != req.Entries[matchEnd].Term {
 				foundConfirm = true
-				err = s.logMgr.truncate(ctx, entry.LogIndex-1)
+				err = s.logMgr.Truncate(ctx, entry.LogIndex-1)
 				if err != nil {
 					return rsp, err
 				}
@@ -724,136 +789,19 @@ func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.Appen
 			rsp.ConflictTerm = followerEntries[matchEnd].Term
 		}
 		if len(afterEntries) > 0 {
-			_, _, err = s.logMgr.followerAppendLog(ctx, afterEntries)
+			_, _, err = s.logMgr.FollowerAppendLog(ctx, afterEntries)
 			if err != nil {
 				return rsp, err
 			}
 		}
 	}
 	rsp.Success = true
-	indexVal = s.logMgr.getLogIndexVal(ctx)
-	s.logMgr.setCommitIndex(max(indexVal.lastCommitIndex, min(req.LeaderCommit, indexVal.lastLogIndex)))
+	indexVal = s.logMgr.GetLogIndexVal(ctx)
+	s.logMgr.SetCommitIndex(max(indexVal.lastCommitIndex, min(req.LeaderCommit, indexVal.lastLogIndex)))
 	s.aw.asyncApply(applyUserSmReq{
 		Ctx:      ctx.Clone(),
 		EndIndex: req.LeaderCommit,
 	})
-	return rsp, nil
-}
-
-func (s *CoreSm) execGetLeader(ctx *context.Context, req *raft.GetLeaderReq) (rsp *raft.GetLeaderRsp, err error) {
-	cq := make(chan smCommandRes, 1)
-	s.q <- smCommand{
-		typ: smCommandGetLeader,
-		ctx: ctx,
-		req: req,
-		cq:  cq,
-	}
-	select {
-	case res := <-cq:
-		if res.Err != nil {
-			return nil, res.Err
-		}
-		rsp = res.Rsp.(*raft.GetLeaderRsp)
-	}
-	return rsp, nil
-}
-
-func (s *CoreSm) execAppendCommands(ctx *context.Context, req *raft.AppendCommandsReq) (rsp *raft.AppendCommandsRsp, err error) {
-	cq := make(chan smCommandRes, 1)
-	s.q <- smCommand{
-		typ: smCommandAppendCommands,
-		ctx: ctx,
-		req: req,
-		cq:  cq,
-	}
-	select {
-	case res := <-cq:
-		if res.Err != nil {
-			return nil, res.Err
-		}
-		rsp = res.Rsp.(*raft.AppendCommandsRsp)
-	}
-	return rsp, nil
-}
-
-func (s *CoreSm) execAppendEntries(ctx *context.Context, req *raft.AppendEntriesReq) (rsp *raft.AppendEntriesRsp, err error) {
-	cq := make(chan smCommandRes, 1)
-	if len(req.Entries) == 0 {
-		s.q <- smCommand{
-			typ: smCommandLeaderHeartBeat,
-			ctx: ctx,
-			req: req,
-			cq:  cq,
-		}
-	} else {
-		s.q <- smCommand{
-			typ: smCommandAppendEntries,
-			ctx: ctx,
-			req: req,
-			cq:  cq,
-		}
-	}
-	select {
-	case res := <-cq:
-		if res.Err != nil {
-			return nil, res.Err
-		}
-		rsp = res.Rsp.(*raft.AppendEntriesRsp)
-	}
-	return rsp, nil
-}
-
-func (s *CoreSm) execRequestVote(ctx *context.Context, req *raft.RequestVoteReq) (rsp *raft.RequestVoteRsp, err error) {
-	cq := make(chan smCommandRes, 1)
-	s.q <- smCommand{
-		typ: smCommandRequestVote,
-		ctx: ctx,
-		req: req,
-		cq:  cq,
-	}
-	select {
-	case res := <-cq:
-		if res.Err != nil {
-			return nil, res.Err
-		}
-		rsp = res.Rsp.(*raft.RequestVoteRsp)
-	}
-	return rsp, nil
-}
-
-func (s *CoreSm) execAddServer(ctx *context.Context, req *raft.AddServerReq) (rsp *raft.AddServerRsp, err error) {
-	cq := make(chan smCommandRes, 1)
-	s.q <- smCommand{
-		typ: smCommandAddServer,
-		ctx: ctx,
-		req: req,
-		cq:  cq,
-	}
-	select {
-	case res := <-cq:
-		if res.Err != nil {
-			return nil, res.Err
-		}
-		rsp = res.Rsp.(*raft.AddServerRsp)
-	}
-	return rsp, nil
-}
-
-func (s *CoreSm) execRemoveServer(ctx *context.Context, req *raft.RemoveServerReq) (rsp *raft.RemoveServerRsp, err error) {
-	cq := make(chan smCommandRes, 1)
-	s.q <- smCommand{
-		typ: smCommandRemoveServer,
-		ctx: ctx,
-		req: req,
-		cq:  cq,
-	}
-	select {
-	case res := <-cq:
-		if res.Err != nil {
-			return nil, res.Err
-		}
-		rsp = res.Rsp.(*raft.RemoveServerRsp)
-	}
 	return rsp, nil
 }
 
@@ -868,6 +816,14 @@ func (s *CoreSm) pushApply2UserSmCb(rsp applyUserSmCb) {
 func (s *CoreSm) pushMatchIndexChangeEv(ev leaderMatchIndexChangeEv) {
 	s.q <- smCommand{
 		typ:    smCommandMatchIndexChangeEv,
+		ctx:    context.Background(),
+		anyReq: ev,
+	}
+}
+
+func (s *CoreSm) pushTermLtEv(ev termLtEv) {
+	s.q <- smCommand{
+		typ:    smCommandTermLtEv,
 		ctx:    context.Background(),
 		anyReq: ev,
 	}
@@ -918,4 +874,104 @@ func (s *CoreSm) handleApply2UserSmCb(cb applyUserSmCb) {
 		}
 
 	}
+}
+
+func (s *CoreSm) leaderTermTermination() {
+	s.state = raft.State_StateFollower
+	s.pw.closeAll()
+}
+
+func (s *CoreSm) handleTermLtEv(ev termLtEv) {
+	if !s.myIsLeader() {
+		slog.Warn("my is not leader, ignore handleTermLtEv")
+		return
+	}
+	myTerm := s.md.get().Term
+	if ev.Term > myTerm {
+		s.leaderTermTermination()
+	}
+}
+
+func (s *CoreSm) asyncHeartBeat(ctx *context.Context, req *raft.AppendEntriesReq) {
+	go func(l []string) {
+		for _, member := range l {
+			_, err := s.rpcCli.AppendEntries(ctx, req, client.WithAddr(member))
+			if err != nil {
+				slog.Error("rpcCli.AppendEntries failed",
+					slog.String("member", member),
+					slog.String("action", "HeartBeat"),
+					slog.String("err", err.Error()),
+				)
+			}
+		}
+	}(s.mm.getList())
+}
+
+func (s *CoreSm) asyncRequestVote(ctx *context.Context, req *raft.RequestVoteReq, cb func(ctx *context.Context, res *asyncVoteRes)) {
+	ctx = ctx.Clone()
+	quorum := s.mm.quorum()
+	memberList := s.mm.getList()
+	go func(ctx *context.Context) {
+		var (
+			voteCount atomic.Uint64
+			errCount  atomic.Uint64
+			succCount atomic.Uint64
+		)
+		voteCount.Add(1)
+		for _, member := range memberList {
+			ctx2 := ctx.Clone()
+			go func(ctx *context.Context, member string) {
+				defer func() {
+					if r := recover(); r != nil {
+						errCount.Add(1)
+					}
+				}()
+				rsp, err := s.rpcCli.RequestVote(ctx, req, client.WithAddr(member))
+				if err != nil {
+					errCount.Add(1)
+				} else {
+					succCount.Add(1)
+					if rsp.VoteGranted {
+						voteCount.Add(1)
+					}
+				}
+				var errStr = "nil"
+				if err != nil {
+					errStr = err.Error()
+				}
+				reqBytes, _ := json.Marshal(req)
+				rspBytes, _ := json.Marshal(rsp)
+				slog.Info("rpc request vote",
+					slog.String("my", s.mm.getMy()),
+					slog.String("member", member),
+					slog.String("req", string(reqBytes)),
+					slog.String("rsp", string(rspBytes)),
+					slog.String("err", errStr))
+			}(ctx2, member)
+		}
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		timeout := time.NewTimer(time.Second * 30)
+		defer timeout.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if voteCount.Load() >= uint64(quorum) || errCount.Load()+succCount.Load() == uint64(len(memberList)) {
+					cb(ctx, &asyncVoteRes{
+						ReqCount:  int(errCount.Load() + succCount.Load()),
+						VoteCount: voteCount.Load(),
+						IsTimeout: false,
+					})
+					return
+				}
+			case <-timeout.C:
+				cb(ctx, &asyncVoteRes{
+					ReqCount:  int(succCount.Load() + errCount.Load()),
+					VoteCount: voteCount.Load(),
+					IsTimeout: true,
+				})
+				return
+			}
+		}
+	}(ctx.Clone())
 }

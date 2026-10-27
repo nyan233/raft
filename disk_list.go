@@ -538,6 +538,17 @@ func (d *diskListReaderWriter) close() error {
 	return nil
 }
 
+func (d *diskListReaderWriter) RangeSegFile(fn func(f *diskList) (bool, error)) error {
+	for _, segFile := range d.segFileList {
+		if ok, err := fn(segFile.r); err != nil {
+			return err
+		} else if ok {
+			return nil
+		}
+	}
+	return nil
+}
+
 func (d *diskListReaderWriter) getSegList(descSort bool) ([]int, error) {
 	dirEntry, err := os.ReadDir(d.dir)
 	if err != nil {
@@ -565,7 +576,7 @@ func (d *diskListReaderWriter) getSegList(descSort bool) ([]int, error) {
 	return segList, nil
 }
 
-func (d *diskListReaderWriter) newScope(s, e uint64) *listScope3 {
+func (d *diskListReaderWriter) Scope(s, e uint64) *listScope3 {
 	return newListScope3(d, s, e)
 }
 
@@ -598,7 +609,7 @@ func (d *diskListReaderWriter) removeSegFile(seg int) error {
 	return nil
 }
 
-func (d *diskListReaderWriter) cleanWithLogIndex(e uint64) error {
+func (d *diskListReaderWriter) CleanWithLogIndex(e uint64) error {
 	removeSeg := make([]int, 0, 8)
 	for _, segFile := range d.segFileList {
 		lastEntry, err := segFile.r.last(true)
@@ -618,13 +629,13 @@ func (d *diskListReaderWriter) cleanWithLogIndex(e uint64) error {
 	return nil
 }
 
-func (d *diskListReaderWriter) truncateWithLogIndex(end uint64) error {
+func (d *diskListReaderWriter) TruncateWithLogIndex(end uint64) error {
 	type rwFile struct {
 		r   *diskList
 		w   *diskList
 		seg int
 	}
-	lastEntry, err := d.last(true)
+	lastEntry, err := d.Last(true)
 	if err != nil {
 		return err
 	}
@@ -696,7 +707,7 @@ func (d *diskListReaderWriter) truncateWithLogIndex(end uint64) error {
 	return nil
 }
 
-func (d *diskListReaderWriter) writeBatch(entries []*raft.Entry) error {
+func (d *diskListReaderWriter) WriteBatch(entries []*raft.Entry) error {
 	// 分批次应用, 单次最多500条
 	const OneMaxCount = 500
 	var (
@@ -741,14 +752,14 @@ func (d *diskListReaderWriter) writeBatch(entries []*raft.Entry) error {
 	return nil
 }
 
-func (d *diskListReaderWriter) first(onlyIdx bool) (*raft.Entry, error) {
+func (d *diskListReaderWriter) First(onlyIdx bool) (*raft.Entry, error) {
 	if len(d.segFileList) == 0 {
 		return d.r.first(onlyIdx)
 	}
 	return d.segFileList[len(d.segFileList)-1].r.first(onlyIdx)
 }
 
-func (d *diskListReaderWriter) last(onlyIdx bool) (*raft.Entry, error) {
+func (d *diskListReaderWriter) Last(onlyIdx bool) (*raft.Entry, error) {
 	entry, err := d.r.last(onlyIdx)
 	if err != nil {
 		return nil, err

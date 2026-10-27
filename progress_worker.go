@@ -22,22 +22,28 @@ type leaderMatchIndexChangeEv struct {
 	New uint64
 }
 
+type termLtEv struct {
+	Term uint64
+	Addr string
+}
+
 type followerProgressWorker struct {
 	mu          sync.Mutex
 	csm         *CoreSm
-	rpc         *coreRpc
+	rpc         raft.RaftProxy
 	name        string
 	ipAddr      string
 	leader      string
 	matchIndex  uint64
 	nextIndex   uint64
+	endIndex    uint64
 	close       chan struct{}
 	updateIndex chan struct{}
 	cbch        chan followerAppendEntriesCb
 	wg          sync.WaitGroup
 }
 
-func newFollowerProgressWorker(csm *CoreSm, rpc *coreRpc, cbch chan followerAppendEntriesCb, name, ipAddr, leader string) *followerProgressWorker {
+func newFollowerProgressWorker(csm *CoreSm, rpc raft.RaftProxy, cbch chan followerAppendEntriesCb, name, ipAddr, leader string) *followerProgressWorker {
 	return &followerProgressWorker{
 		csm:         csm,
 		rpc:         rpc,
@@ -48,6 +54,7 @@ func newFollowerProgressWorker(csm *CoreSm, rpc *coreRpc, cbch chan followerAppe
 		updateIndex: make(chan struct{}, 128),
 		matchIndex:  0,
 		nextIndex:   0,
+		endIndex:    0,
 		cbch:        cbch,
 	}
 }
@@ -55,8 +62,9 @@ func newFollowerProgressWorker(csm *CoreSm, rpc *coreRpc, cbch chan followerAppe
 func (f *followerProgressWorker) run() {
 	f.wg.Add(1)
 	logMgr := f.csm.getLogMgr()
-	indexVal := logMgr.getLogIndexVal(context.Background())
-	f.nextIndex = indexVal.lastLogIndex
+	indexVal := logMgr.GetLogIndexVal(context.Background())
+	f.nextIndex = indexVal.lastApplied
+	f.endIndex = indexVal.lastLogIndex
 	go func() {
 		for {
 			select {
@@ -75,47 +83,72 @@ func (f *followerProgressWorker) run() {
 }
 
 func (f *followerProgressWorker) doSync2Node() bool {
-	f.mu.Lock()
-	if f.nextIndex == f.matchIndex {
-		f.mu.Unlock()
+	var (
+		nextIndex  uint64
+		matchIndex uint64
+		endIndex   uint64
+		prevLogIdx uint64
+		lastLogIdx uint64
+	)
+	f.lock(func() {
+		nextIndex = f.nextIndex
+		matchIndex = f.matchIndex
+		endIndex = f.endIndex
+	})
+	if nextIndex == endIndex && matchIndex == endIndex {
 		return true
 	}
-	startIndex := f.matchIndex
-	endIndex := f.nextIndex
-	if endIndex-startIndex > 50 {
-		endIndex = startIndex + 50
+	prevLogIdx = nextIndex - 1
+	lastLogIdx = endIndex
+	if lastLogIdx-nextIndex > 100 {
+		lastLogIdx = nextIndex + 100
 	}
-	f.mu.Unlock()
 	logMgr := f.csm.getLogMgr()
 	ctx := context.Background()
 	ctx.SetValue("Src", "follower-progress")
-	entries, err := logMgr.readLogWithIndex(ctx, startIndex, endIndex, false)
+	entries, err := logMgr.ReadLogWithIndex(ctx, prevLogIdx, lastLogIdx, false)
 	if err != nil {
 		slog.Error(err.Error())
 		return false
 	}
-	indexVal := logMgr.getLogIndexVal(ctx)
-	// TODO rsp.Term怎么处理？
-	rsp, err := f.rpc.proxy.AppendEntries(ctx, &raft.AppendEntriesReq{
+	prevLog := entries[0]
+	entries = entries[1:]
+	rsp, err := f.rpc.AppendEntries(ctx, &raft.AppendEntriesReq{
 		Term:         f.csm.md.get().Term,
 		LeaderId:     f.leader,
-		PrevLogIndex: entries[0].LogIndex,
-		PrevLogTerm:  entries[0].Term,
+		PrevLogIndex: prevLog.LogIndex,
+		PrevLogTerm:  prevLog.Term,
 		Entries:      entries,
-		LeaderCommit: indexVal.lastCommitIndex,
+		LeaderCommit: logMgr.GetLogIndexVal(ctx).lastCommitIndex,
 	}, client.WithAddr(f.ipAddr))
 	if err != nil {
 		slog.Error(err.Error())
+		if rpcErrorIs(err, raft.ErrCode_ErrTermLtCurrent) {
+			f.csm.pushTermLtEv(termLtEv{
+				Term: rsp.Term,
+				Addr: f.ipAddr,
+			})
+		}
 		return false
 	}
-	_ = rsp
-	f.mu.Lock()
-	f.matchIndex = endIndex
-	f.mu.Unlock()
-	f.cbch <- followerAppendEntriesCb{
-		Name:  f.name,
-		Start: startIndex,
-		End:   endIndex,
+	if !rsp.Success {
+		f.lock(func() {
+			f.nextIndex = rsp.ConflictIndex - 1
+		})
+	} else {
+		f.lock(func() {
+			f.matchIndex = lastLogIdx
+			if lastLogIdx == f.endIndex {
+				f.nextIndex = f.endIndex
+			} else {
+				f.nextIndex = lastLogIdx + 1
+			}
+		})
+		f.cbch <- followerAppendEntriesCb{
+			Name:  f.name,
+			Start: prevLogIdx + 1,
+			End:   endIndex,
+		}
 	}
 	return false
 }
@@ -127,22 +160,28 @@ func (f *followerProgressWorker) stop() {
 	}
 }
 
-func (f *followerProgressWorker) next(logIndex uint64) {
+func (f *followerProgressWorker) lock(fn func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.nextIndex = logIndex
-	select {
-	case f.updateIndex <- struct{}{}:
-		break
-	default:
-		break
-	}
+	fn()
+}
+
+func (f *followerProgressWorker) next(logIndex uint64) {
+	f.lock(func() {
+		f.endIndex = logIndex
+		select {
+		case f.updateIndex <- struct{}{}:
+			break
+		default:
+			break
+		}
+	})
 }
 
 func (f *followerProgressWorker) progress() (uint64, uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.matchIndex, f.nextIndex
+	return f.matchIndex, f.endIndex
 }
 
 type leaderProgressWorker struct {
@@ -173,14 +212,14 @@ func (f *leaderProgressWorker) quorum() int {
 
 // [100, 91, 92, 84, 87] -> 91
 func (f *leaderProgressWorker) run() {
-	indexVal := f.csm.getLogMgr().getLogIndexVal(context.Background())
+	indexVal := f.csm.getLogMgr().GetLogIndexVal(context.Background())
 	f.nextIndex = indexVal.lastLogIndex
 	go func() {
 		for {
 			select {
 			case _ = <-f.cbch:
 				l := make([]uint64, 0, 8)
-				indexVal := f.csm.getLogMgr().getLogIndexVal(context.Background())
+				indexVal := f.csm.getLogMgr().GetLogIndexVal(context.Background())
 				l = append(l, indexVal.lastCommitIndex)
 				f.mu.Lock()
 				for _, v := range f.fmap {
@@ -215,7 +254,7 @@ func (f *leaderProgressWorker) next(logIndex uint64) {
 func (f *leaderProgressWorker) addFollower(name, ipAddr, leader string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	follower := newFollowerProgressWorker(f.csm, f.csm.rpc, f.cbch, name, ipAddr, leader)
+	follower := newFollowerProgressWorker(f.csm, f.csm.rpcCli, f.cbch, name, ipAddr, leader)
 	f.fmap[name] = follower
 	follower.run()
 }
@@ -229,5 +268,13 @@ func (f *leaderProgressWorker) closeAndRemoveFollower(name string) {
 		follower.stop()
 	} else {
 		f.mu.Unlock()
+	}
+}
+
+func (f *leaderProgressWorker) closeAll() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, v := range f.fmap {
+		v.stop()
 	}
 }

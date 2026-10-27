@@ -12,7 +12,7 @@ func TestDiskList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = d.truncateWithLogIndex(0)
+	err = d.TruncateWithLogIndex(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,45 +26,45 @@ func TestDiskList(t *testing.T) {
 				Command:     []byte("hello world, my is a raft lib"),
 			})
 		}
-		err = d.writeBatch(entries)
+		err = d.WriteBatch(entries)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	lastEntry, err := d.last(false)
+	lastEntry, err := d.Last(false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstEntry, err := d.first(false)
+	firstEntry, err := d.First(false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Log(firstEntry)
 	t.Log(lastEntry)
-	err = d.cleanWithLogIndex(2048)
+	err = d.CleanWithLogIndex(2048)
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstEntry, err = d.first(false)
+	firstEntry, err = d.First(false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Log(firstEntry)
-	err = d.truncateWithLogIndex(4500)
+	err = d.TruncateWithLogIndex(4500)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lastEntry, err = d.last(false)
+	lastEntry, err = d.Last(false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Log(lastEntry)
-	scope := d.newScope(4000, 4500)
-	err = scope.find()
+	scope := d.Scope(4000, 4500)
+	err = scope.Find()
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = scope.rangeFor(func(f *diskList, startOff, count uint64) error {
+	err = scope.RangeFor(func(f *diskList, startOff, count uint64) error {
 		entries, err := f.batchRead(int(startOff), int(count), false)
 		if err != nil {
 			t.Fatal(err)
@@ -72,10 +72,6 @@ func TestDiskList(t *testing.T) {
 		t.Log(len(entries))
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = scope.close()
 	if err != nil {
 		t.Fatal(err)
 	}

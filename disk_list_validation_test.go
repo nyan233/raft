@@ -68,7 +68,7 @@ func (f *diskListFixture) open() {
 		}
 	})
 	if err := d.init(); err != nil {
-		f.t.Fatalf("init: %v", err)
+		f.t.Fatalf("Init: %v", err)
 	}
 }
 
@@ -90,18 +90,17 @@ func (f *diskListFixture) write(entries []*pb.Entry) {
 			CommandType: entry.CommandType, Command: bytes.Clone(entry.Command),
 		}
 	}
-	if err := f.d.writeBatch(input); err != nil {
-		f.t.Fatalf("writeBatch: %v", err)
+	if err := f.d.WriteBatch(input); err != nil {
+		f.t.Fatalf("WriteBatch: %v", err)
 	}
 }
 
 func (f *diskListFixture) read(start, end uint64, onlyIndex bool) (entries []*pb.Entry, err error) {
-	scope := f.d.newScope(start, end)
-	if err = scope.find(); err != nil {
-		return nil, err // find closes its temporary handles on failure.
+	scope := f.d.Scope(start, end)
+	if err = scope.Find(); err != nil {
+		return nil, err // Find closes its temporary handles on failure.
 	}
-	defer func() { err = errors.Join(err, scope.close()) }()
-	err = scope.rangeFor(func(list *diskList, offset, count uint64) error {
+	err = scope.RangeFor(func(list *diskList, offset, count uint64) error {
 		batch, err := list.batchRead(int(offset), int(count), onlyIndex)
 		entries = append(entries, batch...)
 		return err
@@ -158,14 +157,14 @@ func (f *diskListFixture) assertState(want []*pb.Entry) {
 		first, last = want[0], want[len(want)-1]
 	}
 	for _, onlyIndex := range []bool{false, true} {
-		got, err := f.d.first(onlyIndex)
+		got, err := f.d.First(onlyIndex)
 		if err != nil {
-			f.t.Fatalf("first: %v", err)
+			f.t.Fatalf("First: %v", err)
 		}
 		assertDiskEntry(f.t, got, first, onlyIndex)
-		got, err = f.d.last(onlyIndex)
+		got, err = f.d.Last(onlyIndex)
 		if err != nil {
-			f.t.Fatalf("last: %v", err)
+			f.t.Fatalf("Last: %v", err)
 		}
 		assertDiskEntry(f.t, got, last, onlyIndex)
 		if len(want) > 0 {
@@ -283,12 +282,12 @@ func TestDiskListValidation(t *testing.T) {
 					valid      bool
 				}{
 					{"all", 1, uint64(len(want)), true},
-					{"first", 1, 1, true},
+					{"First", 1, 1, true},
 					{"segment_end", 3, 3, true},
 					{"segment_start", 4, 4, true},
 					{"cross_segment", 2, 8, true},
 					{"middle", 5, 6, true},
-					{"last", uint64(len(want)), uint64(len(want)), true},
+					{"Last", uint64(len(want)), uint64(len(want)), true},
 					{"missing_start", 0, 2, false},
 					{"past_tail", 1, uint64(len(want) + 1), false},
 					{"missing_range", 20, 25, false},
@@ -342,7 +341,7 @@ func TestDiskListValidation(t *testing.T) {
 				want := diskListEntries(1, 9, 2)
 				f.write(want)
 				for range 2 { // Repeating the same truncation must be harmless.
-					if err := f.d.truncateWithLogIndex(uint64(keep)); err != nil {
+					if err := f.d.TruncateWithLogIndex(uint64(keep)); err != nil {
 						t.Fatal(err)
 					}
 					f.assertState(want[:keep])
@@ -355,7 +354,7 @@ func TestDiskListValidation(t *testing.T) {
 			f := newDiskListFixture(t, 1<<20)
 			want := diskListEntries(1, 3, 2)
 			f.write(want)
-			if err := f.d.truncateWithLogIndex(4); err == nil {
+			if err := f.d.TruncateWithLogIndex(4); err == nil {
 				t.Fatal("truncation beyond the tail should fail")
 			}
 			f.assertState(want)
@@ -366,7 +365,7 @@ func TestDiskListValidation(t *testing.T) {
 		f := newDiskListFixture(t, 1<<20)
 		want := diskListEntries(1, 8, 1)
 		f.write(want)
-		if err := f.d.truncateWithLogIndex(3); err != nil {
+		if err := f.d.TruncateWithLogIndex(3); err != nil {
 			t.Fatal(err)
 		}
 		replacement := diskListEntries(4, 4, 9)
@@ -386,7 +385,7 @@ func TestDiskListValidation(t *testing.T) {
 		f.write(want)
 		f.assertState(want)
 		// Truncation is inclusive: index zero is a real entry in this fixture.
-		if err := f.d.truncateWithLogIndex(0); err != nil {
+		if err := f.d.TruncateWithLogIndex(0); err != nil {
 			t.Fatal(err)
 		}
 		f.assertState(want[:1])
@@ -397,7 +396,7 @@ func TestDiskListValidation(t *testing.T) {
 			for _, keep := range []int{0, 1, 3, 4, 6, 8, 9} {
 				runDiskListCase(t, fmt.Sprintf("main=%t/keep=%d", withMain, keep), func(t *testing.T) {
 					f, want := diskListSegmentFixture(t, withMain)
-					if err := f.d.truncateWithLogIndex(uint64(keep)); err != nil {
+					if err := f.d.TruncateWithLogIndex(uint64(keep)); err != nil {
 						t.Fatal(err)
 					}
 					f.assertState(want[:keep])
@@ -412,12 +411,12 @@ func TestDiskListValidation(t *testing.T) {
 		}
 		runDiskListCase(t, "promote_then_clean", func(t *testing.T) {
 			f, _ := diskListSegmentFixture(t, true)
-			if err := f.d.truncateWithLogIndex(6); err != nil {
+			if err := f.d.TruncateWithLogIndex(6); err != nil {
 				t.Fatal(err)
 			}
 			batch := diskListEntries(7, 3, 20)
 			f.write(batch)
-			if err := f.d.cleanWithLogIndex(9); err != nil {
+			if err := f.d.CleanWithLogIndex(9); err != nil {
 				t.Fatal(err)
 			}
 			// All retained data was rotated and is now eligible for cleanup.
@@ -430,9 +429,9 @@ func TestDiskListValidation(t *testing.T) {
 		for _, tc := range []struct{ cutoff, first uint64 }{
 			{0, 1}, {2, 1}, {3, 4}, {4, 4}, {6, 7}, {9, 10}, {11, 10},
 		} {
-			t.Logf("cleanup <= %d; first retained index should be %d", tc.cutoff, tc.first)
+			t.Logf("cleanup <= %d; First retained index should be %d", tc.cutoff, tc.first)
 			for range 2 {
-				if err := f.d.cleanWithLogIndex(tc.cutoff); err != nil {
+				if err := f.d.CleanWithLogIndex(tc.cutoff); err != nil {
 					t.Fatal(err)
 				}
 				f.assertState(want[tc.first-1:])
@@ -479,7 +478,7 @@ func TestDiskListValidation(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := f.d.first(false); err == nil {
+				if _, err := f.d.First(false); err == nil {
 					t.Fatal("reading a corrupted entry should return an error, not success or an empty result")
 				}
 			})
@@ -508,7 +507,7 @@ func TestDiskListValidation(t *testing.T) {
 						case 2:
 							keep := 1 + rng.IntN(len(want))
 							t.Logf("step %d: keep through %d", step, keep)
-							if err := f.d.truncateWithLogIndex(uint64(keep)); err != nil {
+							if err := f.d.TruncateWithLogIndex(uint64(keep)); err != nil {
 								t.Fatal(err)
 							}
 							want = want[:keep:keep]

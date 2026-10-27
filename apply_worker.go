@@ -35,13 +35,13 @@ func (w *applyWorker) doApply(req applyUserSmReq) error {
 	defer w.ticker.Reset(1 * time.Second)
 	logMgr := w.csm.getLogMgr()
 	if req.StartIndex == 0 {
-		indexVal := logMgr.getLogIndexVal(req.Ctx)
+		indexVal := logMgr.GetLogIndexVal(req.Ctx)
 		req.StartIndex = indexVal.lastApplied
 	}
 	if req.StartIndex >= req.EndIndex {
 		return nil
 	}
-	err := logMgr.applyLogWithOffV2(req.Ctx, req.StartIndex, req.EndIndex)
+	err := logMgr.ApplyLogWithOffV2(req.Ctx, req.StartIndex, req.EndIndex)
 	if err != nil {
 		return err
 	}
@@ -70,7 +70,7 @@ func (w *applyWorker) run() {
 					break
 				}
 				ctx := context.Background()
-				indexVal := w.csm.getLogMgr().getLogIndexVal(ctx)
+				indexVal := w.csm.getLogMgr().GetLogIndexVal(ctx)
 				noApplied := indexVal.lastCommitIndex - indexVal.lastApplied
 				if noApplied > 0 {
 					if noApplied > 100 {

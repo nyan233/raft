@@ -41,7 +41,7 @@ func (mgr *raftLogManager) initFile() error {
 	if err != nil {
 		return err
 	}
-	entry, err := mgr.lrw.last(true)
+	entry, err := mgr.lrw.Last(true)
 	if err != nil {
 		return err
 	}
@@ -52,7 +52,7 @@ func (mgr *raftLogManager) initFile() error {
 	return nil
 }
 
-func (mgr *raftLogManager) init() error {
+func (mgr *raftLogManager) Init() error {
 	err := mgr.initFile()
 	if err != nil {
 		return err
@@ -97,31 +97,31 @@ func (mgr *raftLogManager) cleanLogSeg() {
 	}
 	// NOTE 2026/10/16 保留最后一条日志, 用于AppendEntries日志检查
 	cleanEnd := lastApplied - 1
-	err = mgr.lrw.cleanWithLogIndex(cleanEnd)
+	err = mgr.lrw.CleanWithLogIndex(cleanEnd)
 	if err != nil {
-		slog.Error("cleanWithLogIndex", slog.String("err", err.Error()))
+		slog.Error("CleanWithLogIndex", slog.String("err", err.Error()))
 	}
 }
 
-func (mgr *raftLogManager) setCommitIndex(idx uint64) {
+func (mgr *raftLogManager) SetCommitIndex(idx uint64) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	mgr.indexVal.lastCommitIndex = idx
 }
 
-func (mgr *raftLogManager) getLogIndexVal(ctx *context.Context) raftLogIndexVal {
+func (mgr *raftLogManager) GetLogIndexVal(ctx *context.Context) raftLogIndexVal {
 	mgr.mu.RLock()
 	defer mgr.mu.RUnlock()
 	return *mgr.indexVal
 }
 
-func (mgr *raftLogManager) followerAppendLog(ctx *context.Context, entries []*raft.Entry) (uint64, uint64, error) {
+func (mgr *raftLogManager) FollowerAppendLog(ctx *context.Context, entries []*raft.Entry) (uint64, uint64, error) {
 	if len(entries) == 0 {
 		return mgr.indexVal.lastLogIndex, mgr.indexVal.lastLogIndex, nil
 	}
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
-	err := mgr.lrw.writeBatch(entries)
+	err := mgr.lrw.WriteBatch(entries)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -130,7 +130,7 @@ func (mgr *raftLogManager) followerAppendLog(ctx *context.Context, entries []*ra
 	return entries[0].LogIndex, mgr.indexVal.lastLogIndex, nil
 }
 
-func (mgr *raftLogManager) leaderAppendLog(ctx *context.Context, term uint64, entries []*raft.Entry) (uint64, uint64, error) {
+func (mgr *raftLogManager) LeaderAppendLog(ctx *context.Context, term uint64, entries []*raft.Entry) (uint64, uint64, error) {
 	if len(entries) == 0 {
 		return mgr.indexVal.lastLogIndex, mgr.indexVal.lastLogIndex, nil
 	}
@@ -140,7 +140,7 @@ func (mgr *raftLogManager) leaderAppendLog(ctx *context.Context, term uint64, en
 		entries[i].Term = term
 		entries[i].LogIndex = mgr.indexVal.lastLogIndex + i + 1
 	}
-	err := mgr.lrw.writeBatch(entries)
+	err := mgr.lrw.WriteBatch(entries)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -171,24 +171,8 @@ func (mgr *raftLogManager) doApplyLog2UserSm(ctx *context.Context, entries []*ra
 }
 
 func (mgr *raftLogManager) noLockDoApplyLogWithOffV2(ctx *context.Context, start, end uint64) error {
-	scope := mgr.lrw.newScope(start, end)
-	err := scope.find()
-	if err != nil {
-		return err
-	}
-	entries := make([]*raft.Entry, 0, 128)
-	err = scope.rangeFor(func(f *diskList, startOff, count uint64) error {
-		readEntries, err := f.batchRead(int(startOff), int(count), false)
-		if err != nil {
-			return err
-		}
-		entries = append(entries, readEntries...)
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	err = scope.close()
+	scope := mgr.lrw.Scope(start, end)
+	entries, err := scope.ReadAll(false)
 	if err != nil {
 		return err
 	}
@@ -199,78 +183,45 @@ func (mgr *raftLogManager) noLockDoApplyLogWithOffV2(ctx *context.Context, start
 	return nil
 }
 
-func (mgr *raftLogManager) applyLogWithOffV2(ctx *context.Context, start, end uint64) error {
+func (mgr *raftLogManager) ApplyLogWithOffV2(ctx *context.Context, start, end uint64) error {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	return mgr.noLockDoApplyLogWithOffV2(ctx, start, end)
 }
 
-func (mgr *raftLogManager) applyLogWithCount(ctx *context.Context, count int) error {
-	if count <= 0 {
-		return nil
-	}
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-	oldApplied := mgr.indexVal.lastApplied
-	newApplied := oldApplied + uint64(count)
-	return mgr.noLockDoApplyLogWithOffV2(ctx, oldApplied, newApplied)
-}
-
-func (mgr *raftLogManager) readLogWithIndex(ctx *context.Context, start, end uint64, onlyIdx bool) ([]*raft.Entry, error) {
+func (mgr *raftLogManager) ReadLogWithIndex(ctx *context.Context, start, end uint64, onlyIdx bool) ([]*raft.Entry, error) {
 	mgr.mu.RLock()
 	defer mgr.mu.RUnlock()
-	scope := mgr.lrw.newScope(start, end)
-	err := scope.find()
-	if err != nil {
-		return nil, err
-	}
-	defer scope.close()
-	entries := make([]*raft.Entry, 0, end-start)
-	err = scope.rangeFor(func(f *diskList, startOff, count uint64) error {
-		readEntries, err := f.batchRead(int(startOff), int(count), onlyIdx)
-		if err != nil {
-			return err
-		}
-		entries = append(entries, readEntries...)
-		return nil
-	})
+	scope := mgr.lrw.Scope(start, end)
+	entries, err := scope.ReadAll(onlyIdx)
 	if err != nil {
 		return nil, err
 	}
 	return entries, nil
 }
 
-func (mgr *raftLogManager) readLog(ctx *context.Context, index uint64, onlyIdx bool) (*raft.Entry, error) {
+func (mgr *raftLogManager) ReadLog(ctx *context.Context, index uint64, onlyIdx bool) (*raft.Entry, error) {
 	mgr.mu.RLock()
 	defer mgr.mu.RUnlock()
 	return mgr.doReadLog(ctx, index, onlyIdx)
 }
 
 func (mgr *raftLogManager) doReadLog(ctx *context.Context, index uint64, onlyIdx bool) (*raft.Entry, error) {
-	scope := mgr.lrw.newScope(index, index)
-	err := scope.find()
+	scope := mgr.lrw.Scope(index, index)
+	entries, err := scope.ReadAll(onlyIdx)
 	if err != nil {
 		return nil, err
 	}
-	defer scope.close()
-	var entry *raft.Entry
-	err = scope.rangeFor(func(f *diskList, startOff, count uint64) error {
-		entry, err = f.readOff(int(startOff), onlyIdx)
-		if err != nil {
-			return err
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
+	if len(entries) > 0 {
+		return entries[0], nil
 	}
-	return entry, nil
+	return nil, nil
 }
 
-func (mgr *raftLogManager) truncate(ctx *context.Context, end uint64) error {
+func (mgr *raftLogManager) Truncate(ctx *context.Context, end uint64) error {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
-	err := mgr.lrw.truncateWithLogIndex(end)
+	err := mgr.lrw.TruncateWithLogIndex(end)
 	if err != nil {
 		return err
 	}

@@ -203,6 +203,6 @@ func TestSmRead(t *testing.T) {
 	if len(entries) != 1800 {
 		t.Fatalf("len(entries)=%d", len(entries))
 	} else {
-		t.Logf("len(entries)=%d, first=%+v, last=%+v", len(entries), entries[0], entries[len(entries)-1])
+		t.Logf("len(entries)=%d, First=%+v, Last=%+v", len(entries), entries[0], entries[len(entries)-1])
 	}
 }
