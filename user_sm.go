@@ -5,9 +5,15 @@ import (
 	"github.com/nyan233/raft/pb/message/raft"
 )
 
+type ChannelSnapshot struct {
+	Val *raft.Entry
+	Err error
+}
+
 type StateMachine interface {
 	Init(ctx *context.Context) error
 	LastApplied(ctx *context.Context) (uint64, error)
 	Apply(ctx *context.Context, entries []*raft.Entry) error
 	Snapshot(ctx *context.Context) ([]*raft.Entry, error)
+	SnapshotChannel(ctx *context.Context) (<-chan *raft.Entry, error)
 }

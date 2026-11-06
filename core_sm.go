@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -29,9 +30,9 @@ const (
 	smCommandInsertNoOp
 	smCommandAddServer
 	smCommandRemoveServer
-	smCommandMatchIndexChangeEv
 	smCommandApplyUserSmCb
 	smCommandTermLtEv
+	smCommandReplicateAppendEntriesCb
 )
 
 const (
@@ -48,8 +49,9 @@ type holdAppendCommandsReq struct {
 }
 
 type smCommandRes struct {
-	Rsp proto.Message
-	Err error
+	Rsp    proto.Message
+	AnyRsp interface{}
+	Err    error
 }
 
 type asyncVoteRes struct {
@@ -90,11 +92,11 @@ type CoreSm struct {
 	logMgr              *raftLogManager
 	md                  *meta
 	tt                  *timeoutTicker
-	pw                  *leaderProgressWorker
 	aw                  *applyWorker
 	holdList            []*holdAppendCommandsReq
 	mm                  *memberManager
 	rpcCli              raft.RaftProxy
+	rsm                 *replicationSm
 }
 
 func NewCoreSm(cfg CoreSmConfig) *CoreSm {
@@ -160,6 +162,10 @@ func (s *CoreSm) initRpc() error {
 	return nil
 }
 
+func (s *CoreSm) getTerm() uint64 {
+	return s.md.get().Term
+}
+
 func (s *CoreSm) getLogMgr() *raftLogManager {
 	return s.logMgr
 }
@@ -209,6 +215,10 @@ func (s *CoreSm) startTimeoutTicker() {
 		},
 	})
 	s.tt.init()
+}
+
+func (s *CoreSm) pushCommand(cmd smCommand) {
+	s.q <- cmd
 }
 
 func (s *CoreSm) startLoop() {
@@ -301,10 +311,16 @@ func (s *CoreSm) startLoop() {
 				}
 			case smCommandApplyUserSmCb:
 				s.handleApply2UserSmCb(cmd.anyReq.(applyUserSmCb))
-			case smCommandMatchIndexChangeEv:
-				s.handleMatchIndexChange(cmd.anyReq.(leaderMatchIndexChangeEv))
 			case smCommandTermLtEv:
 				s.handleTermLtEv(cmd.anyReq.(termLtEv))
+			case smCommandReplicateAppendEntriesCb:
+				rsp, err := s.handleReplicateAppendEntries(cmd.ctx, cmd.anyReq.(followerAppendEntriesCb2))
+				if cmd.cq != nil {
+					cmd.cq <- smCommandRes{
+						Err:    err,
+						AnyRsp: rsp,
+					}
+				}
 			}
 		}
 	}
@@ -394,22 +410,6 @@ func (s *CoreSm) execRemoveServerFromLoop(ctx *context.Context, req *raft.Remove
 	return
 }
 
-//func (s *CoreSm) execCommandAsyncEntriesCompFromLoop(ctx *context.Context, anyReq *asyncAppendEntriesRes) (*raft.AppendCommandsRsp, error) {
-//	rsp := &raft.AppendCommandsRsp{
-//		LastLogIndex: anyReq.Req.PrevLogIndex,
-//		LastLogTerm:  anyReq.Req.PrevLogTerm,
-//	}
-//	var err error
-//	// 未达到多数派
-//	if anyReq.SuccessCount < s.rpc.minSuccessReq() {
-//
-//	}
-//	if len(anyReq.Req.Entries) > 0 {
-//		s.logMgr.SetCommitIndex(anyReq.Req.PrevLogIndex + uint64(len(anyReq.Req.Entries)))
-//	}
-//	return rsp, err
-//}
-
 func (s *CoreSm) insertNoOp(ctx *context.Context) error {
 	return s.insertLog(ctx, raft.CommandType_NoOpCommand, []byte("raft-noop"))
 }
@@ -433,60 +433,24 @@ func (s *CoreSm) insertLog(ctx *context.Context, typ raft.CommandType, dat []byt
 			Command:     dat,
 		},
 	}
-	_, endLogIndex, err := s.logMgr.LeaderAppendLog(ctx, s.md.get().Term, entries)
+	_, endLogIndex, err := s.logMgr.LeaderAppendLog(ctx, s.getTerm(), entries)
 	if err != nil {
 		return err
 	}
-	//s.rpc.asyncAppendEntries(ctx, &raft.AppendEntriesReq{
-	//	Term:         s.md.get().Term,
-	//	LeaderId:     s.rpc.Leader,
-	//	PrevLogIndex: indexVal.lastLogIndex,
-	//	PrevLogTerm:  indexVal.lastLogTerm,
-	//	Entries:      entries,
-	//}, func(ctx *context.Context, res *asyncAppendEntriesRes) {
-	//	s.q <- smCommand{
-	//		typ:    smCommandAsyncAppendEntriesComp,
-	//		ctx:    ctx,
-	//		anyReq: res,
-	//	}
-	//})
-	s.pw.next(endLogIndex)
-	return nil
+	return s.newLog(ctx, endLogIndex)
 }
 
 func (s *CoreSm) execCommandAsyncRequestVoteCompFromLoop(ctx *context.Context, res *asyncVoteRes) error {
 	if s.state != raft.State_StateCandidate {
 		return nil
 	}
-	//minVote := len(s.rpc.Membership)/2 + 1
-	//if res.VoteCount >= uint64(minVote) {
-	//	s.state = raft.State_StateLeader
-	//	s.rpc.Leader = s.rpc.My
-	//	slog.Info("my is leader, call broadcastAppendEntries2AllMemberShip", slog.String("my", s.rpc.My))
-	//	indexVal := s.logMgr.GetLogIndexVal(ctx)
-	//	s.rpc.asyncAppendEntries(ctx, &raft.AppendEntriesReq{
-	//		Term:         s.md.get().Term,
-	//		LeaderId:     s.rpc.My,
-	//		PrevLogIndex: indexVal.lastLogIndex,
-	//		PrevLogTerm:  indexVal.lastLogTerm,
-	//		Entries:      nil,
-	//		LeaderCommit: indexVal.lastCommitIndex,
-	//	}, func(ctx *context.Context, res *asyncAppendEntriesRes) {
-	//		s.createAndStartProgressWorker()
-	//		// 插入no-op日志
-	//		s.q <- smCommand{
-	//			typ:    smCommandInsertNoOp,
-	//			ctx:    ctx,
-	//			anyReq: res,
-	//		}
-	//		return
-	//	})
-	//
-	//}
 	// NOTE: 插入no-op后会自动管理复制进度, 不需要在此处手动发心跳
 	if res.VoteCount >= uint64(s.mm.quorum()) {
 		s.state = raft.State_StateLeader
-		s.createAndStartProgressWorker()
+		err := s.createReplicateSm(ctx)
+		if err != nil {
+			panic("create replicate sm failed")
+		}
 		// 插入no-op日志
 		s.q <- smCommand{
 			typ:    smCommandInsertNoOp,
@@ -497,12 +461,98 @@ func (s *CoreSm) execCommandAsyncRequestVoteCompFromLoop(ctx *context.Context, r
 	return nil
 }
 
-func (s *CoreSm) createAndStartProgressWorker() {
-	s.pw = newLeaderProgressWorker(s)
-	s.pw.run()
-	for _, member := range s.mm.getList() {
-		s.pw.addFollower(member, member, s.mm.getMy())
+func (s *CoreSm) newLog(ctx *context.Context, index uint64) error {
+	return s.rsm.newLog(index, func(f *followerReplicationSm, start, end uint64) error {
+		return s.asyncSendAppendEntries(ctx, f.addr, start, end, false)
+	})
+}
+
+func (s *CoreSm) asyncSendAppendEntries(ctx *context.Context, member string, start, end uint64, isHeartbeat bool) error {
+	indexVal := s.getLogMgr().indexVal
+	term := s.getTerm()
+	leader := s.mm.getMy()
+	leaderCommit := indexVal.lastCommitIndex
+	if leaderCommit == 0 {
+		leaderCommit = indexVal.lastApplied
 	}
+	prevLogIndex := uint64(0)
+	prevLogTerm := uint64(0)
+	if start > 1 {
+		prevLogIndex = start - 1
+		prevLog, err := s.logMgr.ReadLog(ctx, prevLogIndex, true)
+		if err != nil {
+			return err
+		}
+		prevLogTerm = prevLog.Term
+	}
+	if isHeartbeat {
+		req := &raft.AppendEntriesReq{
+			Term:         term,
+			LeaderId:     leader,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      nil,
+			LeaderCommit: leaderCommit,
+		}
+		err := s.rsm.pushReq2Follower(member, ctx, req)
+		if err != nil {
+			return err
+		}
+	} else {
+		go func(ctx *context.Context) {
+			entries, err := s.logMgr.ReadLogWithIndex(ctx, start, end, false)
+			if err != nil {
+				s.pushCommand(smCommand{
+					typ: smCommandReplicateAppendEntriesCb,
+					ctx: ctx,
+					anyReq: followerAppendEntriesCb2{
+						Name: member,
+						Ctx:  ctx,
+						Err:  err,
+					},
+				})
+				return
+			}
+			req := &raft.AppendEntriesReq{
+				Term:         term,
+				LeaderId:     leader,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: leaderCommit,
+			}
+			err = s.rsm.pushReq2Follower(member, ctx, req)
+			if err != nil {
+				slog.Error("pushReq2Follower", slog.String("err", err.Error()))
+			}
+		}(ctx.Clone())
+	}
+	return nil
+}
+
+func (s *CoreSm) createReplicateSm(ctx *context.Context) error {
+	s.rsm = newReplicationSm(s)
+	indexVal := s.logMgr.GetLogIndexVal(context.Background())
+	//s.rsm.newLog(indexVal.lastLogIndex)
+	//for _, member := range s.mm.getList() {
+	//	s.rsm.addFollower(member, &followerReplicationSm{
+	//		state:      replicationSmStateProbe,
+	//		matchIndex: 0,
+	//		nextIndex:  indexVal.lastApplied,
+	//	})
+	//	err := s.asyncSendAppendEntries(ctx, member, indexVal.lastApplied, indexVal.lastApplied, true)
+	//	if err != nil {
+	//		return err
+	//	}
+	//}
+	for _, member := range s.mm.getList() {
+		if member != s.mm.getMy() {
+			s.rsm.addFollower(member, indexVal.lastLogIndex)
+		}
+	}
+	return s.rsm.newLog(indexVal.lastLogIndex, func(f *followerReplicationSm, start, end uint64) error {
+		return s.asyncSendAppendEntries(ctx, f.addr, start, end, true)
+	})
 }
 
 func (s *CoreSm) enterCandidate() error {
@@ -572,10 +622,16 @@ func (s *CoreSm) insertCommands(ctx *context.Context, cq chan smCommandRes, comm
 		if endLogIndex > holdReq.endLogIndex {
 			holdReq.endLogIndex = endLogIndex
 		}
-		s.pw.next(endLogIndex)
+		err = s.newLog(ctx, endLogIndex)
+		if err != nil {
+			return err
+		}
 	}
 	if cq != nil {
 		s.holdList = append(s.holdList, holdReq)
+		slices.SortFunc(s.holdList, func(a, b *holdAppendCommandsReq) int {
+			return cmp.Compare(a.endLogIndex, b.endLogIndex)
+		})
 	}
 	return nil
 }
@@ -643,41 +699,86 @@ func (s *CoreSm) execRequestVoteFromLoop(ctx *context.Context, req *raft.Request
 	return
 }
 
-func (s *CoreSm) execLeaderHeartBeatFromLoop(ctx *context.Context, req *raft.AppendEntriesReq) (rsp *raft.AppendEntriesRsp, err error) {
-	//slog.Debug("leader heartbeat", slog.String("leader", req.LeaderId), slog.String("my", s.rpc.My))
-
+func (s *CoreSm) appendEntriesCheck(ctx *context.Context, req *raft.AppendEntriesReq) (next bool, rsp *raft.AppendEntriesRsp, err error) {
 	rsp = new(raft.AppendEntriesRsp)
-	if req.Term > s.md.get().Term {
+	myTerm := s.getTerm()
+	if req.Term > myTerm {
 		s.state = raft.State_StateFollower
 		err = s.md.save(metaData{
-			VoteFor: "",
+			VoteFor: req.LeaderId,
 			Term:    req.Term,
 		})
 		if err != nil {
 			return
 		}
-	} else if s.md.get().Term > req.Term {
-		err = emitErr(raft.ErrCode_ErrTermLtCurrent, slog.Uint64("req_term", req.Term), slog.Uint64("my_term", s.md.get().Term))
-		return
-	}
-	s.lastLeaderHeartBeat = time.Now()
-	s.mm.setLeader(req.LeaderId)
-	rsp.Term = s.md.get().Term
-
-	indexVal := s.logMgr.GetLogIndexVal(ctx)
-	// 索引比follower持有得多, leader通常需要回退索引
-	if req.PrevLogIndex > indexVal.lastLogIndex {
+	} else if myTerm > req.Term {
 		rsp.Success = false
-		rsp.Term = s.md.get().Term
-		rsp.ConflictIndex = indexVal.lastLogIndex
-		rsp.ConflictTerm = indexVal.lastLogTerm
+		rsp.Term = myTerm
+		return
+	} else if myTerm == req.Term {
+		s.state = raft.State_StateFollower
+	}
+	myTerm = s.getTerm()
+	s.lastLeaderHeartBeat = time.Now()
+	s.tt.ResetTicker(candidateTicker)
+	s.mm.setLeader(req.LeaderId)
+	rsp.Term = myTerm
+	next = true
+	return
+}
+
+func (s *CoreSm) execLeaderHeartBeatFromLoop(ctx *context.Context, req *raft.AppendEntriesReq) (rsp *raft.AppendEntriesRsp, err error) {
+	//slog.Debug("leader heartbeat", slog.String("leader", req.LeaderId), slog.String("my", s.rpc.My))
+	var next bool
+	next, rsp, err = s.appendEntriesCheck(ctx, req)
+	if err != nil || !next {
 		return
 	}
+	var (
+		firstEntry, lastEntry, prevLogEntry *raft.Entry
+	)
+	firstEntry, err = s.logMgr.First(ctx, true)
+	if err != nil {
+		return
+	}
+	lastEntry, err = s.logMgr.Last(ctx, true)
+	if err != nil {
+		return
+	}
+	if firstEntry == nil || lastEntry == nil {
+		rsp.Success = false
+		rsp.ConflictIndex = req.PrevLogIndex
+		rsp.ConflictTerm = req.PrevLogTerm
+		return
+	} else if firstEntry.LogIndex <= req.PrevLogIndex && req.PrevLogIndex <= lastEntry.LogIndex {
+		prevLogEntry, err = s.logMgr.ReadLog(ctx, req.PrevLogIndex, true)
+		if err != nil {
+			return
+		}
+		if prevLogEntry.Term != req.PrevLogTerm {
+			err = s.logMgr.Truncate(ctx, prevLogEntry.LogIndex-1)
+			if err != nil {
+				return
+			}
+			rsp.Success = false
+			rsp.ConflictIndex = prevLogEntry.LogIndex
+			rsp.ConflictTerm = prevLogEntry.Term
+			return
+		} else {
+			rsp.Success = true
+		}
+	} else {
+		rsp.Success = false
+		rsp.ConflictIndex = lastEntry.LogIndex
+		rsp.ConflictTerm = lastEntry.Term
+		return
+	}
+
 	if s.state == raft.State_StateFollower {
 		s.aw.asyncApply(applyUserSmReq{
 			Ctx:        ctx.Clone(),
 			StartIndex: 0,
-			EndIndex:   req.LeaderCommit,
+			EndIndex:   min(lastEntry.LogIndex, req.LeaderCommit),
 		})
 	}
 
@@ -686,123 +787,99 @@ func (s *CoreSm) execLeaderHeartBeatFromLoop(ctx *context.Context, req *raft.App
 
 func (s *CoreSm) execAppendEntriesFromLoop(ctx *context.Context, req *raft.AppendEntriesReq) (rsp *raft.AppendEntriesRsp, err error) {
 	slog.Info("leader append entries", slog.String("leader", req.LeaderId), slog.String("my", s.mm.getMy()))
-	myTerm := s.md.get().Term
-	rsp = &raft.AppendEntriesRsp{
-		Term: myTerm,
-	}
-	if myTerm > req.Term {
-		err = emitErr(raft.ErrCode_ErrTermLtCurrent, slog.Uint64("req_term", req.Term), slog.Uint64("my_term", myTerm))
+	var next bool
+	next, rsp, err = s.appendEntriesCheck(ctx, req)
+	if err != nil || !next {
 		return
 	}
-	indexVal := s.logMgr.GetLogIndexVal(ctx)
-	type logCheckScope struct {
-		S uint64
-		E uint64
-	}
-	followerScope := logCheckScope{
-		S: indexVal.lastApplied,
-		E: indexVal.lastLogIndex,
-	}
-	leaderScope := logCheckScope{
-		S: req.Entries[0].LogIndex,
-		E: req.Entries[len(req.Entries)-1].LogIndex,
-	}
-	if req.PrevLogIndex < followerScope.S {
-		// f_applied: 107
-		// f_log_list: 108~110
-		// l_log_prev: 105
-		rsp.ConflictIndex = followerScope.S
-		rsp.Success = false
+	var (
+		firstEntry, lastEntry *raft.Entry
+	)
+	firstEntry, err = s.logMgr.First(ctx, true)
+	if err != nil {
 		return
-	} else if req.PrevLogIndex > followerScope.E {
-		// f_applied: 107
-		// f_log_list: 108~110
-		// l_log_prev: 120
-		rsp.ConflictIndex = followerScope.E
-		rsp.Term = indexVal.lastLogTerm
-		rsp.Success = false
+	}
+	lastEntry, err = s.logMgr.Last(ctx, true)
+	if err != nil {
 		return
-	} else if req.PrevLogIndex == followerScope.E {
-		// f_applied: 105
-		// f_log_list: 106~110
-		// l_log_prev_log: 110
-		// l_log_list: 111~120
-		if req.PrevLogTerm != indexVal.lastLogTerm {
-			rsp.ConflictIndex = req.PrevLogIndex
-			rsp.ConflictTerm = req.PrevLogTerm
+	}
+	if firstEntry == nil || lastEntry == nil {
+		if req.PrevLogIndex > 0 {
 			rsp.Success = false
-			return rsp, nil
+			rsp.ConflictIndex = 1
+			return
 		}
 		_, _, err = s.logMgr.FollowerAppendLog(ctx, req.Entries)
 		if err != nil {
-			return rsp, err
+			return
 		}
-	} else if followerScope.S <= req.PrevLogIndex && req.PrevLogIndex < followerScope.E {
-		// f_applied: 105
-		// f_log_list: 106~110
-		// l_log_prev_log: 107
-		// l_log_list: 108~120
-		// leader日志索引从follower有效索引范围中开始, 需要校验logTerm, 不一致的话follower需要truncate, leader需要回退
-		logEntry, err := s.logMgr.ReadLog(ctx, req.PrevLogIndex, false)
-		if err != nil {
-			return rsp, err
-		}
-		if logEntry.Term != req.PrevLogTerm {
-			err = s.logMgr.Truncate(ctx, req.PrevLogIndex)
-			if err != nil {
-				return nil, err
-			}
-			rsp.ConflictIndex = req.PrevLogIndex
-			rsp.ConflictTerm = req.PrevLogTerm
+		rsp.Success = true
+		s.logMgr.SetCommitIndex(min(s.logMgr.GetLogIndexVal(ctx).lastLogIndex, req.LeaderCommit))
+		return
+	}
+	if req.PrevLogIndex > 0 {
+		if req.PrevLogIndex < firstEntry.LogIndex {
 			rsp.Success = false
-			return rsp, nil
+			rsp.ConflictIndex = firstEntry.LogIndex
+			rsp.ConflictTerm = firstEntry.Term
+			return
+		} else if req.PrevLogIndex > lastEntry.LogIndex {
+			rsp.Success = false
+			rsp.ConflictIndex = lastEntry.LogIndex
+			rsp.ConflictTerm = lastEntry.Term
+			return
 		}
-		// 根据上述规则, leader这边的log 108~110需要和follower已有的比较, 如果term不一致则认为冲突, follower需要truncate并接受leader的日志
-		cmpIndexScope := logCheckScope{
-			S: req.Entries[0].LogIndex,
-		}
-		if leaderScope.E > followerScope.E {
-			cmpIndexScope.E = followerScope.E
-		} else {
-			cmpIndexScope.E = leaderScope.E
-		}
-		followerEntries, err := s.logMgr.ReadLogWithIndex(ctx, cmpIndexScope.S, cmpIndexScope.E, true)
+		var (
+			prevLogEntry *raft.Entry
+		)
+		prevLogEntry, err = s.logMgr.ReadLog(ctx, req.PrevLogIndex, true)
 		if err != nil {
-			return rsp, err
+			return
 		}
-		matchEnd := 0
-		foundConfirm := false
-		for _, entry := range followerEntries {
-			if entry.Term != req.Entries[matchEnd].Term {
-				foundConfirm = true
-				err = s.logMgr.Truncate(ctx, entry.LogIndex-1)
-				if err != nil {
-					return rsp, err
-				}
-				break
-			}
-			matchEnd++
-		}
-		afterEntries := req.Entries[matchEnd:]
-		if foundConfirm {
-			rsp.ConflictIndex = followerEntries[matchEnd].LogIndex
-			rsp.ConflictTerm = followerEntries[matchEnd].Term
-		}
-		if len(afterEntries) > 0 {
-			_, _, err = s.logMgr.FollowerAppendLog(ctx, afterEntries)
-			if err != nil {
-				return rsp, err
-			}
+		if prevLogEntry.Term != req.PrevLogTerm {
+			rsp.Success = false
+			rsp.ConflictIndex = prevLogEntry.LogIndex
+			rsp.ConflictTerm = prevLogEntry.Term
+			return
 		}
 	}
-	rsp.Success = true
-	indexVal = s.logMgr.GetLogIndexVal(ctx)
-	s.logMgr.SetCommitIndex(max(indexVal.lastCommitIndex, min(req.LeaderCommit, indexVal.lastLogIndex)))
+	leaderFirstLog := req.Entries[0].LogIndex
+	leaderLastLog := req.Entries[len(req.Entries)-1].LogIndex
+	newCommit := max(s.logMgr.GetLogIndexVal(ctx).lastCommitIndex, min(req.LeaderCommit, leaderLastLog))
+	if firstEntry.LogIndex <= leaderLastLog && leaderFirstLog <= lastEntry.LogIndex {
+		if leaderLastLog > lastEntry.LogIndex {
+			leaderLastLog = lastEntry.LogIndex
+		}
+		var leaderCmpLog []*raft.Entry
+		leaderCmpLog, err = s.logMgr.ReadLogWithIndex(ctx, leaderFirstLog, leaderLastLog, true)
+		if err != nil {
+			return
+		}
+		for i, v := range leaderCmpLog {
+			if req.Entries[i].Term != v.Term {
+				err = s.logMgr.Truncate(ctx, v.LogIndex-1)
+				if err != nil {
+					return
+				}
+				leaderCmpLog = leaderCmpLog[:i]
+				break
+			}
+		}
+		req.Entries = req.Entries[len(leaderCmpLog):]
+	}
+	if len(req.Entries) > 0 {
+		_, _, err = s.logMgr.FollowerAppendLog(ctx, req.Entries)
+		if err != nil {
+			return
+		}
+	}
+	s.logMgr.SetCommitIndex(newCommit)
 	s.aw.asyncApply(applyUserSmReq{
 		Ctx:      ctx.Clone(),
-		EndIndex: req.LeaderCommit,
+		EndIndex: newCommit,
 	})
-	return rsp, nil
+	rsp.Success = true
+	return
 }
 
 func (s *CoreSm) pushApply2UserSmCb(rsp applyUserSmCb) {
@@ -813,12 +890,19 @@ func (s *CoreSm) pushApply2UserSmCb(rsp applyUserSmCb) {
 	}
 }
 
-func (s *CoreSm) pushMatchIndexChangeEv(ev leaderMatchIndexChangeEv) {
-	s.q <- smCommand{
-		typ:    smCommandMatchIndexChangeEv,
-		ctx:    context.Background(),
-		anyReq: ev,
+func (s *CoreSm) matchIndexChangeEv(ev leaderMatchIndexChangeEv) {
+	if !s.myIsLeader() {
+		slog.Warn("my is not leader, ignore apply usersm",
+			slog.Uint64("old", ev.Old),
+			slog.Uint64("new", ev.New),
+		)
+		return
 	}
+	s.logMgr.SetCommitIndex(ev.New)
+	s.aw.asyncApply(applyUserSmReq{
+		Ctx:      context.Background(),
+		EndIndex: ev.New,
+	})
 }
 
 func (s *CoreSm) pushTermLtEv(ev termLtEv) {
@@ -829,32 +913,18 @@ func (s *CoreSm) pushTermLtEv(ev termLtEv) {
 	}
 }
 
-func (s *CoreSm) handleMatchIndexChange(ev leaderMatchIndexChangeEv) {
-	if !s.myIsLeader() {
-		slog.Warn("my is not leader, ignore apply usersm",
-			slog.Uint64("old", ev.Old),
-			slog.Uint64("new", ev.New),
-		)
-		return
-	}
-	s.aw.asyncApply(applyUserSmReq{
-		Ctx:      context.Background(),
-		EndIndex: ev.New,
-	})
-}
-
 func (s *CoreSm) handleApply2UserSmCb(cb applyUserSmCb) {
 	if !s.myIsLeader() {
 		slog.Warn("my is not leader, ignore handleApply2UserSmCb")
 		return
 	}
 	succHold := make([]*holdAppendCommandsReq, 0, 16)
-	for len(s.holdList) > 0 {
-		firstHold := s.holdList[0]
-		if cb.Req.EndIndex >= firstHold.endLogIndex {
-			succHold = append(succHold, firstHold)
+	for _, v := range s.holdList {
+		if cb.Req.EndIndex >= v.endLogIndex {
+			succHold = append(succHold, v)
+		} else {
+			break
 		}
-		s.holdList = s.holdList[1:]
 	}
 	for _, h := range succHold {
 		select {
@@ -863,7 +933,7 @@ func (s *CoreSm) handleApply2UserSmCb(cb applyUserSmCb) {
 				LastLogIndex: h.endLogIndex,
 				LastLogTerm:  h.logTerm,
 			},
-			Err: nil,
+			Err: cb.Error,
 		}:
 			break
 		default:
@@ -874,11 +944,11 @@ func (s *CoreSm) handleApply2UserSmCb(cb applyUserSmCb) {
 		}
 
 	}
+	s.holdList = s.holdList[len(succHold):]
 }
 
 func (s *CoreSm) leaderTermTermination() {
 	s.state = raft.State_StateFollower
-	s.pw.closeAll()
 }
 
 func (s *CoreSm) handleTermLtEv(ev termLtEv) {
@@ -893,18 +963,29 @@ func (s *CoreSm) handleTermLtEv(ev termLtEv) {
 }
 
 func (s *CoreSm) asyncHeartBeat(ctx *context.Context, req *raft.AppendEntriesReq) {
-	go func(l []string) {
-		for _, member := range l {
-			_, err := s.rpcCli.AppendEntries(ctx, req, client.WithAddr(member))
-			if err != nil {
-				slog.Error("rpcCli.AppendEntries failed",
-					slog.String("member", member),
-					slog.String("action", "HeartBeat"),
-					slog.String("err", err.Error()),
-				)
-			}
+	if !s.myIsLeader() {
+		return
+	}
+	for _, v := range s.mm.getList() {
+		if v != s.mm.getMy() {
+			go func(member string) {
+				rsp, err := s.rpcCli.AppendEntries(ctx, req, client.WithAddr(member))
+				if err != nil {
+					slog.Error("rpcCli.AppendEntries failed",
+						slog.String("member", member),
+						slog.String("action", "HeartBeat"),
+						slog.String("err", err.Error()),
+					)
+				}
+				if rsp.Term > req.Term {
+					s.pushTermLtEv(termLtEv{
+						Term: rsp.Term,
+						Addr: member,
+					})
+				}
+			}(v)
 		}
-	}(s.mm.getList())
+	}
 }
 
 func (s *CoreSm) asyncRequestVote(ctx *context.Context, req *raft.RequestVoteReq, cb func(ctx *context.Context, res *asyncVoteRes)) {
@@ -974,4 +1055,28 @@ func (s *CoreSm) asyncRequestVote(ctx *context.Context, req *raft.RequestVoteReq
 			}
 		}
 	}(ctx.Clone())
+}
+
+func (s *CoreSm) handleReplicateAppendEntries(ctx *context.Context, anyReq followerAppendEntriesCb2) (rsp followerAppendEntriesCmdRes, err error) {
+	// 出错了需要回退并重试
+	if anyReq.Err != nil {
+		rsp.Retry = true
+		return
+	}
+	var next bool
+	next, err = s.rsm.handleFollowerAppendEntriesCb(anyReq.Name, anyReq.Ctx, anyReq.Req, anyReq.Rsp)
+	if err != nil {
+		slog.Error("handleFollowerAppendEntriesCb", slog.String("err", err.Error()))
+		return
+	}
+	// 完成hold的请求
+	if next {
+		// 并未结束, 接着同步进度
+		nextStart, nextEnd := s.rsm.followerNextIndex(anyReq.Name)
+		err = s.asyncSendAppendEntries(context.Background(), anyReq.Name, nextStart, nextEnd, false)
+		if err != nil {
+			slog.Error(err.Error())
+		}
+	}
+	return
 }

@@ -39,6 +39,8 @@ enum ErrCode {
   ErrInvalidRequest = 10015;
   ErrVoteForByTerm = 10016;
   ErrTermLtCurrent = 10017;
+  ErrFollowerNotFound = 10018;
+  ErrNoFollower = 10019;
 }
 
 message RequestVoteReq {
@@ -67,6 +69,8 @@ message AppendEntriesRsp {
   bool success = 2;
   uint64 conflict_term = 3;
   uint64 conflict_index = 4;
+  uint64 follower_scope_s = 5;
+  uint64 follower_scope_e = 6;
 }
 
 message Entry {

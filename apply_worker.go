@@ -36,9 +36,9 @@ func (w *applyWorker) doApply(req applyUserSmReq) error {
 	logMgr := w.csm.getLogMgr()
 	if req.StartIndex == 0 {
 		indexVal := logMgr.GetLogIndexVal(req.Ctx)
-		req.StartIndex = indexVal.lastApplied
+		req.StartIndex = indexVal.lastApplied + 1
 	}
-	if req.StartIndex >= req.EndIndex {
+	if req.StartIndex > req.EndIndex {
 		return nil
 	}
 	err := logMgr.ApplyLogWithOffV2(req.Ctx, req.StartIndex, req.EndIndex)
@@ -64,24 +64,6 @@ func (w *applyWorker) run() {
 					Req:   req,
 					Error: w.doApply(req),
 				})
-			case <-w.ticker.C:
-				// rq有数据不触发兜底, 这种情况下一般是go的select选择就绪channel的机制导致走到这个逻辑了
-				if len(w.rq) > 0 {
-					break
-				}
-				ctx := context.Background()
-				indexVal := w.csm.getLogMgr().GetLogIndexVal(ctx)
-				noApplied := indexVal.lastCommitIndex - indexVal.lastApplied
-				if noApplied > 0 {
-					if noApplied > 100 {
-						noApplied = 100
-					}
-					req := applyUserSmReq{StartIndex: indexVal.lastApplied, EndIndex: indexVal.lastApplied + noApplied}
-					w.csm.pushApply2UserSmCb(applyUserSmCb{
-						Req:   req,
-						Error: w.doApply(req),
-					})
-				}
 			}
 		}
 	}()

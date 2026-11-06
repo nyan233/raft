@@ -39,6 +39,15 @@ raft log设计为一个文件组, 有`idx`&`data`文件, `idx`仅存储log元数
 - appendCommands触发的事件
 - 定时器兜底
 
+#### FSM
+复制状态机需要有三种状态`Probe`/`Replicate`/`InstalSnashopt`
+- `Probe`代表进度一致, 无需同步进度给follower
+- `Replicate`代表复制中, 正在同步数据给节点
+- `InstalSnashopt`是特殊的复制中状态, 缺少的数据太多, 通过快照快速恢复数据
+
+FSM的状态转移由CoreSm触发, CoreSm通过调整state和index改变状态机状态, 再通过接收RPC Callback的结果来调整状态机
+当Follower的复制进度达成多数派的时候可以释放hold住的appendCommands请求
+
 如果像是新节点进来的这种情况, 某个节点日志落后太多的进度管理器会看情况进入安装快照流程
 
 ## raft client

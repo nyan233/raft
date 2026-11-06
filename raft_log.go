@@ -2,7 +2,9 @@ package raft
 
 import (
 	"log/slog"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nyan233/littlerpc/core/common/context"
@@ -10,7 +12,7 @@ import (
 )
 
 const (
-	logDataMaxSize = 1024 * 1024 // 1GB
+	cleanLogWindow = 5000
 )
 
 type raftLogIndexVal struct {
@@ -21,10 +23,11 @@ type raftLogIndexVal struct {
 }
 
 type raftLogManager struct {
-	mu       sync.RWMutex
-	indexVal *raftLogIndexVal
-	lrw      *diskListReaderWriter
-	sm       StateMachine
+	mu            sync.RWMutex
+	indexVal      *raftLogIndexVal
+	lrw           *diskListReaderWriter
+	sm            StateMachine
+	closeLogClean atomic.Bool
 }
 
 func newRaftLogManager(dirPath string, logName string, sm StateMachine) *raftLogManager {
@@ -62,13 +65,18 @@ func (mgr *raftLogManager) Init() error {
 	if err != nil {
 		return err
 	}
-	mgr.startBgLogSegClean()
+	mgr.indexVal.lastApplied, err = mgr.sm.LastApplied(ctx)
+	if err != nil {
+		return err
+	}
+	// TODO 先不弄日志清理了, 后面再上安装快照这些优化吧, 日志清理涉及到很多东西
+	// mgr.startBgLogSegClean()
 	return nil
 }
 
 func (mgr *raftLogManager) startBgLogSegClean() {
 	go func() {
-		ticker := time.NewTicker(time.Second * 5)
+		ticker := time.NewTicker(time.Second)
 		for {
 			select {
 			case <-ticker.C:
@@ -86,6 +94,9 @@ func (mgr *raftLogManager) cleanLogSeg() {
 			return
 		}
 	}()
+	if mgr.closeLogClean.Load() {
+		return
+	}
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	lastApplied, err := mgr.sm.LastApplied(context.Background())
@@ -95,8 +106,10 @@ func (mgr *raftLogManager) cleanLogSeg() {
 	if lastApplied <= 0 {
 		return
 	}
-	// NOTE 2026/10/16 保留最后一条日志, 用于AppendEntries日志检查
-	cleanEnd := lastApplied - 1
+	if lastApplied < cleanLogWindow {
+		return
+	}
+	cleanEnd := lastApplied - cleanLogWindow
 	err = mgr.lrw.CleanWithLogIndex(cleanEnd)
 	if err != nil {
 		slog.Error("CleanWithLogIndex", slog.String("err", err.Error()))
@@ -164,13 +177,15 @@ func (mgr *raftLogManager) doApplyLog2UserSm(ctx *context.Context, entries []*ra
 		if err != nil {
 			return err
 		}
+		mgr.indexVal.lastApplied = entries[count-1].LogIndex
 		entries = entries[count:]
-		mgr.indexVal.lastApplied += uint64(count)
 	}
 	return nil
 }
 
-func (mgr *raftLogManager) noLockDoApplyLogWithOffV2(ctx *context.Context, start, end uint64) error {
+func (mgr *raftLogManager) ApplyLogWithOffV2(ctx *context.Context, start, end uint64) error {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
 	scope := mgr.lrw.Scope(start, end)
 	entries, err := scope.ReadAll(false)
 	if err != nil {
@@ -183,10 +198,18 @@ func (mgr *raftLogManager) noLockDoApplyLogWithOffV2(ctx *context.Context, start
 	return nil
 }
 
-func (mgr *raftLogManager) ApplyLogWithOffV2(ctx *context.Context, start, end uint64) error {
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-	return mgr.noLockDoApplyLogWithOffV2(ctx, start, end)
+func (mgr *raftLogManager) LogEntryExist(ctx *context.Context, logIndex uint64) (bool, error) {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	scope := mgr.lrw.Scope(logIndex, logIndex)
+	err := scope.Find()
+	if err != nil {
+		if strings.HasPrefix(err.Error(), "unknown file offset") {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (mgr *raftLogManager) ReadLogWithIndex(ctx *context.Context, start, end uint64, onlyIdx bool) ([]*raft.Entry, error) {
@@ -225,12 +248,42 @@ func (mgr *raftLogManager) Truncate(ctx *context.Context, end uint64) error {
 	if err != nil {
 		return err
 	}
+	if end == 0 {
+		mgr.indexVal.lastLogTerm = 0
+		mgr.indexVal.lastLogIndex = 0
+		return nil
+	}
 	// update index val
 	endEntry, err := mgr.doReadLog(ctx, end, true)
 	if err != nil {
 		return err
 	}
-	mgr.indexVal.lastLogIndex = endEntry.LogIndex
-	mgr.indexVal.lastLogTerm = endEntry.Term
+	if endEntry == nil {
+		mgr.indexVal.lastLogTerm = 0
+		mgr.indexVal.lastLogIndex = 0
+	} else {
+		mgr.indexVal.lastLogIndex = endEntry.LogIndex
+		mgr.indexVal.lastLogTerm = endEntry.Term
+	}
 	return nil
+}
+
+func (mgr *raftLogManager) StopLogClean() {
+	mgr.closeLogClean.Store(true)
+}
+
+func (mgr *raftLogManager) StartLogClean() {
+	mgr.closeLogClean.Store(false)
+}
+
+func (mgr *raftLogManager) First(ctx *context.Context, onlyIdx bool) (*raft.Entry, error) {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	return mgr.lrw.First(onlyIdx)
+}
+
+func (mgr *raftLogManager) Last(ctx *context.Context, onlyIdx bool) (*raft.Entry, error) {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	return mgr.lrw.Last(onlyIdx)
 }
