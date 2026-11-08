@@ -247,10 +247,18 @@ func (s *replicationSm) handleFollowerAppendEntriesCb(name string, ctx *context.
 	next = f.state != replicationSmStateProbe
 	oldMatch, newMatch := s.next()
 	if newMatch > oldMatch {
-		s.csm.matchIndexChangeEv(leaderMatchIndexChangeEv{
-			Old: oldMatch,
-			New: newMatch,
-		})
+		var newMatchLog *raft.Entry
+		newMatchLog, err = s.csm.logMgr.ReadLog(ctx, newMatch, true)
+		if err != nil {
+			return
+		}
+		if newMatchLog.Term == myTerm {
+			s.csm.getLogMgr().SetCommitIndex(newMatch)
+			s.csm.aw.asyncApply(applyUserSmReq{
+				Ctx:      context.Background(),
+				EndIndex: newMatch,
+			})
+		}
 	}
 	return
 }

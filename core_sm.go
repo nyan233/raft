@@ -502,16 +502,7 @@ func (s *CoreSm) asyncSendAppendEntries(ctx *context.Context, member string, sta
 		go func(ctx *context.Context) {
 			entries, err := s.logMgr.ReadLogWithIndex(ctx, start, end, false)
 			if err != nil {
-				s.pushCommand(smCommand{
-					typ: smCommandReplicateAppendEntriesCb,
-					ctx: ctx,
-					anyReq: followerAppendEntriesCb2{
-						Name: member,
-						Ctx:  ctx,
-						Err:  err,
-					},
-				})
-				return
+				panic(fmt.Sprintf("node(%s) log(%d-%d) read error: %v", s.mm.getMy(), start, end, err))
 			}
 			req := &raft.AppendEntriesReq{
 				Term:         term,
@@ -888,21 +879,6 @@ func (s *CoreSm) pushApply2UserSmCb(rsp applyUserSmCb) {
 		ctx:    context.Background(),
 		anyReq: rsp,
 	}
-}
-
-func (s *CoreSm) matchIndexChangeEv(ev leaderMatchIndexChangeEv) {
-	if !s.myIsLeader() {
-		slog.Warn("my is not leader, ignore apply usersm",
-			slog.Uint64("old", ev.Old),
-			slog.Uint64("new", ev.New),
-		)
-		return
-	}
-	s.logMgr.SetCommitIndex(ev.New)
-	s.aw.asyncApply(applyUserSmReq{
-		Ctx:      context.Background(),
-		EndIndex: ev.New,
-	})
 }
 
 func (s *CoreSm) pushTermLtEv(ev termLtEv) {
