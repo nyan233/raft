@@ -7,38 +7,50 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync/atomic"
 
 	"golang.org/x/sys/windows"
 )
 
-func (m *meta) openFile(create bool) (*os.File, error) {
+type jsonFile[T any] struct {
+	val  atomic.Pointer[T]
+	path string
+}
+
+func newJSONFile[T any](path string) *jsonFile[T] {
+	return &jsonFile[T]{
+		path: path,
+	}
+}
+
+func (j *jsonFile[T]) openFile(create bool) (*os.File, error) {
 	flag := os.O_RDWR
 	if create {
 		flag |= os.O_CREATE
 	}
 
-	return os.OpenFile(m.path, flag, 0644)
+	return os.OpenFile(j.path, flag, 0644)
 }
 
-func (m *meta) init() error {
+func (j *jsonFile[T]) init() error {
 initLogic:
-	file, err := m.openFile(false)
+	file, err := j.openFile(false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			file2, err2 := os.OpenFile(m.path+".new", os.O_RDWR, 0644)
+			file2, err2 := os.OpenFile(j.path+".new", os.O_RDWR, 0644)
 			if err2 == nil {
 				// Windows 下 rename / replace 前必须先把句柄关掉。
 				if err2 = file2.Close(); err2 != nil {
 					return err2
 				}
 
-				if err2 = moveFileReplace(m.path+".new", m.path); err2 != nil {
+				if err2 = moveFileReplace(j.path+".new", j.path); err2 != nil {
 					return err2
 				}
 
 				goto initLogic
 			} else if errors.Is(err2, os.ErrNotExist) {
-				file, err = m.openFile(true)
+				file, err = j.openFile(true)
 				if err != nil {
 					return err
 				}
@@ -58,22 +70,22 @@ initLogic:
 	}
 
 	if len(bytes) == 0 {
-		m.d = &metaData{}
+		j.val.Store(new(T))
 		return nil
 	}
 
-	var md metaData
-	if err = json.Unmarshal(bytes, &md); err != nil {
+	var val T
+	if err = json.Unmarshal(bytes, &val); err != nil {
 		return err
 	}
 
-	m.d = &md
+	j.val.Store(&val)
 	return nil
 }
 
-func (m *meta) save(md metaData) error {
+func (j *jsonFile[T]) save(val T) error {
 	newFile, err := os.OpenFile(
-		m.path+".new",
+		j.path+".new",
 		os.O_CREATE|os.O_TRUNC|os.O_WRONLY,
 		0644,
 	)
@@ -81,7 +93,7 @@ func (m *meta) save(md metaData) error {
 		return err
 	}
 
-	jsBytes, err := json.Marshal(md)
+	jsBytes, err := json.Marshal(val)
 	if err != nil {
 		_ = newFile.Close()
 		return err
@@ -101,11 +113,11 @@ func (m *meta) save(md metaData) error {
 		return err
 	}
 
-	if err = moveFileReplace(m.path+".new", m.path); err != nil {
+	if err = moveFileReplace(j.path+".new", j.path); err != nil {
 		return err
 	}
 
-	m.d = &md
+	j.val.Store(&val)
 	return nil
 }
 

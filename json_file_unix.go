@@ -8,16 +8,28 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 )
 
-func (m *meta) init() error {
+type jsonFile[T any] struct {
+	val  atomic.Pointer[T]
+	path string
+}
+
+func newJSONFile[T any](path string) *jsonFile[T] {
+	return &jsonFile[T]{
+		path: path,
+	}
+}
+
+func (j *jsonFile[T]) init() error {
 initLogic:
-	file, err := m.openFile(false)
+	file, err := j.openFile(false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			file2, err2 := os.OpenFile(m.path+".new", os.O_RDWR, 0644)
+			file2, err2 := os.OpenFile(j.path+".new", os.O_RDWR, 0644)
 			if err2 == nil {
-				err2 = os.Rename(m.path+".new", m.path)
+				err2 = os.Rename(j.path+".new", j.path)
 				if err2 != nil {
 					file2.Close()
 					return err2
@@ -25,7 +37,7 @@ initLogic:
 				file2.Close()
 				goto initLogic
 			} else if errors.Is(err2, os.ErrNotExist) {
-				file, err = m.openFile(true)
+				file, err = j.openFile(true)
 				if err != nil {
 					return err
 				}
@@ -42,36 +54,40 @@ initLogic:
 		return err
 	}
 	if len(bytes) == 0 {
-		m.d = &metaData{}
+		j.val.Store(new(T))
 		return nil
 	}
-	var md metaData
-	err = json.Unmarshal(bytes, &md)
+	var val T
+	err = json.Unmarshal(bytes, &val)
 	if err != nil {
 		return err
 	}
-	m.d = &md
+	j.val.Store(&val)
 	return nil
 }
 
-func (m *meta) openFile(create bool) (*os.File, error) {
+func (j *jsonFile[T]) openFile(create bool) (*os.File, error) {
 	flag := os.O_RDWR
 	if create {
 		flag |= os.O_CREATE
 	}
-	file, err := os.OpenFile(m.path, flag, 0644)
+	file, err := os.OpenFile(j.path, flag, 0644)
 	if err != nil {
 		return nil, err
 	}
 	return file, nil
 }
 
-func (m *meta) save(md metaData) error {
-	newFile, err := os.OpenFile(m.path+".new", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+func (j *jsonFile[T]) get() *T {
+	return j.val.Load()
+}
+
+func (j *jsonFile[T]) save(val T) error {
+	newFile, err := os.OpenFile(j.path+".new", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
-	jsBytes, err := json.Marshal(md)
+	jsBytes, err := json.Marshal(val)
 	if err != nil {
 		return err
 	}
@@ -87,11 +103,11 @@ func (m *meta) save(md metaData) error {
 	if err != nil {
 		return err
 	}
-	err = os.Rename(m.path+".new", m.path)
+	err = os.Rename(j.path+".new", j.path)
 	if err != nil {
 		return err
 	}
-	dir, err := os.Open(filepath.Dir(m.path))
+	dir, err := os.Open(filepath.Dir(j.path))
 	if err != nil {
 		return err
 	}
@@ -101,6 +117,6 @@ func (m *meta) save(md metaData) error {
 		return err
 	}
 
-	m.d = &md
+	j.val.Store(&val)
 	return nil
 }

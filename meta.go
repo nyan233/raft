@@ -6,29 +6,35 @@ type metaData struct {
 }
 
 type meta struct {
-	d    *metaData
-	path string
+	jf *jsonFile[metaData]
 }
 
 func newMeta(path string) *meta {
 	return &meta{
-		path: path,
+		jf: newJSONFile[metaData](path),
 	}
 }
 
+func (m *meta) init() error {
+	return m.jf.init()
+}
+
 func (m *meta) close() error {
-	m.d = nil
 	return nil
 }
 
 func (m *meta) get() *metaData {
-	return m.d
+	return m.jf.get()
+}
+
+func (m *meta) save(md metaData) error {
+	return m.jf.save(md)
 }
 
 func (m *meta) termIncr() (uint64, error) {
 	d := *m.get()
 	d.Term++
-	err := m.save(d)
+	err := m.jf.save(d)
 	if err != nil {
 		return 0, err
 	}
