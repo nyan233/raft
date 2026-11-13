@@ -8,6 +8,7 @@ require (
 )
 
 require (
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/lafikl/consistent v0.0.0-20220512074542-bdd3606bfc3e // indirect
 	github.com/lesismal/llib v1.2.2 // indirect
 	github.com/lesismal/nbio v1.6.9 // indirect
