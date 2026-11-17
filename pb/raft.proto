@@ -41,6 +41,7 @@ enum ErrCode {
   ErrTermLtCurrent = 10017;
   ErrFollowerNotFound = 10018;
   ErrNoFollower = 10019;
+  ErrLeaderStepDown = 10020;
 }
 
 message RequestVoteReq {

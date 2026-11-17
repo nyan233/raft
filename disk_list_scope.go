@@ -62,6 +62,7 @@ func (s *listScope3) findStart() (foundStart bool, err error) {
 			return false, err
 		}
 		if appendFileOff(f, firstEntry, lastEntry) {
+			foundStart = true
 			return true, nil
 		}
 		return false, nil
@@ -69,7 +70,7 @@ func (s *listScope3) findStart() (foundStart bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	return false, nil
+	return
 }
 
 func (s *listScope3) findEnd() error {

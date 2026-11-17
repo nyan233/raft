@@ -1,10 +1,10 @@
 package raft
 
 type membershipData struct {
-	me       string
-	logIndex uint64
-	term     uint64
-	list     []string
+	Me       string   `json:"me"`
+	LogIndex uint64   `json:"log_index"`
+	Term     uint64   `json:"term"`
+	List     []string `json:"list"`
 }
 
 type membership struct {

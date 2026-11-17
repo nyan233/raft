@@ -25,14 +25,14 @@ type raftLogIndexVal struct {
 type raftLogManager struct {
 	mu            sync.RWMutex
 	indexVal      *raftLogIndexVal
-	lrw           *diskListReaderWriter
+	lrw           LogDiskI
 	sm            StateMachine
 	closeLogClean atomic.Bool
 }
 
 func newRaftLogManager(dirPath string, logName string, sm StateMachine) *raftLogManager {
 	return &raftLogManager{
-		lrw:      newDiskListReaderWriter(dirPath, logName, -1),
+		lrw:      newDiskListReaderWriter(dirPath, logName, 0),
 		sm:       sm,
 		indexVal: new(raftLogIndexVal),
 	}
@@ -40,7 +40,7 @@ func newRaftLogManager(dirPath string, logName string, sm StateMachine) *raftLog
 
 func (mgr *raftLogManager) initFile() error {
 	var err error
-	err = mgr.lrw.init()
+	err = mgr.lrw.Init()
 	if err != nil {
 		return err
 	}
@@ -120,6 +120,12 @@ func (mgr *raftLogManager) SetCommitIndex(idx uint64) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	mgr.indexVal.lastCommitIndex = idx
+}
+
+func (mgr *raftLogManager) GetCommitIndex() uint64 {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	return mgr.indexVal.lastCommitIndex
 }
 
 func (mgr *raftLogManager) GetLogIndexVal(ctx *context.Context) raftLogIndexVal {

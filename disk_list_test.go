@@ -8,7 +8,7 @@ import (
 
 func TestDiskList(t *testing.T) {
 	d := newDiskListReaderWriter("test", "rw.test.l", 1024)
-	err := d.init()
+	err := d.Init()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +23,7 @@ func TestDiskList(t *testing.T) {
 				Term:        uint64(i),
 				LogIndex:    uint64(j),
 				CommandType: uint32(raft.CommandType_UserCommand),
-				Command:     []byte("hello world, my is a raft lib"),
+				Command:     []byte("hello world, Me is a raft lib"),
 			})
 		}
 		err = d.WriteBatch(entries)

@@ -4,8 +4,25 @@ import (
 	"log"
 
 	"github.com/nyan233/littlerpc/core/middle/codec"
+	"github.com/nyan233/raft/pb/message/raft"
 	"google.golang.org/protobuf/proto"
 )
+
+type LogDiskI interface {
+	Init() error
+	First(onlyIdx bool) (*raft.Entry, error)
+	Last(onlyIdx bool) (*raft.Entry, error)
+	TruncateWithLogIndex(end uint64) error
+	CleanWithLogIndex(e uint64) error
+	WriteBatch(entries []*raft.Entry) error
+	Scope(s, e uint64) LogScope
+}
+
+type LogScope interface {
+	Find() error
+	ReadAll(onlyIdx bool) ([]*raft.Entry, error)
+	RangeFor(fn func(f *diskList, startOff, count uint64) error) error
+}
 
 type protoCodec struct{}
 

@@ -471,7 +471,7 @@ func newDiskListReaderWriter(dir string, name string, dataSizeMax int64) *diskLi
 	return d
 }
 
-func (d *diskListReaderWriter) init() error {
+func (d *diskListReaderWriter) Init() error {
 	err := d.initFile()
 	if err != nil {
 		return err
@@ -576,7 +576,7 @@ func (d *diskListReaderWriter) getSegList(descSort bool) ([]int, error) {
 	return segList, nil
 }
 
-func (d *diskListReaderWriter) Scope(s, e uint64) *listScope3 {
+func (d *diskListReaderWriter) Scope(s, e uint64) LogScope {
 	return newListScope3(d, s, e)
 }
 

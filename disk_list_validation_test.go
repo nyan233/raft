@@ -47,7 +47,7 @@ func (f *diskListFixture) open() {
 	d := newDiskListReaderWriter(f.dir, "log", f.limit)
 	f.d = d
 	f.t.Cleanup(func() {
-		// A failed operation may leave closed handles in the segment list.
+		// A failed operation may leave closed handles in the segment List.
 		// Close every remaining descriptor even when one is already closed.
 		lists := []*diskList{d.r, d.w}
 		for _, seg := range d.segFileList {
@@ -67,7 +67,7 @@ func (f *diskListFixture) open() {
 			}
 		}
 	})
-	if err := d.init(); err != nil {
+	if err := d.Init(); err != nil {
 		f.t.Fatalf("Init: %v", err)
 	}
 }

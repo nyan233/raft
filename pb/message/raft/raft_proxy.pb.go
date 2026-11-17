@@ -3,7 +3,7 @@ package raft
 
 /*
    @Generator   : protoc-gen-go-lrpc
-   @CreateTime  : 2026-11-02 19:25:59.052307 +0800 CST
+   @CreateTime  : 2026-11-13 12:56:17.086651 +0800 CST
    @Author      : NoAuthor
    @Comment     : code is auto generate do not edit
 */
@@ -14,11 +14,11 @@ import (
 )
 
 var (
-	_ caller115e2d91088d4658889a2feac9a417aa = new(client.Client)
+	_ callere418e6611cb2431baf43f8353cd2ae70 = new(client.Client)
 	_ RaftProxy                              = new(raftImpl)
 )
 
-type caller115e2d91088d4658889a2feac9a417aa interface {
+type callere418e6611cb2431baf43f8353cd2ae70 interface {
 	Request2(service string, opts []client.CallOption, reqCount int, args ...interface{}) error
 }
 
@@ -35,16 +35,16 @@ type RaftProxy interface {
 }
 
 type raftImpl struct {
-	caller115e2d91088d4658889a2feac9a417aa
+	callere418e6611cb2431baf43f8353cd2ae70
 }
 
-func NewRaft(b caller115e2d91088d4658889a2feac9a417aa) RaftProxy {
+func NewRaft(b callere418e6611cb2431baf43f8353cd2ae70) RaftProxy {
 	proxy := new(raftImpl)
-	c, ok := b.(caller115e2d91088d4658889a2feac9a417aa)
+	c, ok := b.(callere418e6611cb2431baf43f8353cd2ae70)
 	if !ok {
 		panic("the argument is not implemented caller")
 	}
-	proxy.caller115e2d91088d4658889a2feac9a417aa = c
+	proxy.callere418e6611cb2431baf43f8353cd2ae70 = c
 	return proxy
 }
 

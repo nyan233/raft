@@ -44,7 +44,10 @@ func (s *followerReplicationSm) startReqProcess() {
 	go func() {
 		for {
 			select {
-			case req := <-s.rq:
+			case req, ok := <-s.rq:
+				if !ok {
+					return
+				}
 			doRequest:
 				cq := make(chan smCommandRes, 1)
 				rsp, err := s.csm.rpcCli.AppendEntries(req.Ctx, req.Req, client.WithAddr(s.addr))
@@ -87,9 +90,12 @@ func (s *followerReplicationSm) pushReq(ctx *context.Context, req *raft.AppendEn
 }
 
 func (s *followerReplicationSm) next() (uint64, uint64) {
+	// 初始探测时
+	if s.state == replicationSmStateProbe && s.matchIndex == 0 {
+		return s.nextIndex, s.nextIndex
+	}
 	if s.nextIndex > s.maxLogIndex {
-		s.state = replicationSmStateProbe
-		return 0, 0
+		return s.maxLogIndex, s.maxLogIndex
 	}
 	endIndex := s.maxLogIndex
 	if endIndex-s.nextIndex > 50 {
@@ -137,12 +143,12 @@ func (s *replicationSm) newLog(index uint64, newReqFunc func(f *followerReplicat
 	return nil
 }
 
-func (s *replicationSm) addFollower(name string, initNextIndex uint64) {
+func (s *replicationSm) addFollower(name string, lastLogIndex uint64) {
 	f := &followerReplicationSm{
 		csm:         s.csm,
 		state:       replicationSmStateProbe,
 		matchIndex:  0,
-		nextIndex:   initNextIndex,
+		nextIndex:   lastLogIndex + 1,
 		maxLogIndex: s.maxLogIndex,
 		addr:        name,
 		rq:          make(chan *followerAppendEntriesReq, 256),
@@ -163,7 +169,7 @@ func (s *replicationSm) quorum() int {
 	return s.csm.mm.quorum()
 }
 
-func (s *replicationSm) next() (uint64, uint64) {
+func (s *replicationSm) calMatch() (uint64, uint64) {
 	fmatch := make([]uint64, 0, 8)
 	for _, follower := range s.followers {
 		fmatch = append(fmatch, follower.matchIndex)
@@ -201,25 +207,15 @@ func (s *replicationSm) handleFollowerAppendEntriesCb(name string, ctx *context.
 		err = emitErr(raft.ErrCode_ErrFollowerNotFound, name)
 		return
 	}
-	myTerm := s.csm.getTerm()
-	// 通常是过时的请求
-	if rsp.Term > myTerm {
-		err = emitErr(raft.ErrCode_ErrTermLtCurrent, myTerm)
-		return
-	}
-	// 请求顺序不对?单follower串行执行不可能不一致的
-	if req.PrevLogIndex != f.nextIndex-1 {
-		err = emitErr(raft.ErrCode_ErrInvalidRequest)
-		return
-	}
 	lastLogIndex := req.PrevLogIndex
 	if len(req.Entries) > 0 {
 		lastLogIndex = req.Entries[len(req.Entries)-1].LogIndex
 	}
 	if rsp.Success {
-		// 成功了说明索引是一致的, 推进matchIndex
-		f.matchIndex = lastLogIndex
-		f.nextIndex = lastLogIndex + 1
+		if lastLogIndex > f.matchIndex {
+			f.matchIndex = lastLogIndex
+			f.nextIndex = f.matchIndex + 1
+		}
 	} else {
 		// 根据情况调整冲突索引
 		var (
@@ -241,18 +237,19 @@ func (s *replicationSm) handleFollowerAppendEntriesCb(name string, ctx *context.
 			f.nextIndex = 1
 		}
 	}
+
 	if f.matchIndex == f.maxLogIndex {
 		f.state = replicationSmStateProbe
 	}
 	next = f.state != replicationSmStateProbe
-	oldMatch, newMatch := s.next()
+	oldMatch, newMatch := s.calMatch()
 	if newMatch > oldMatch {
 		var newMatchLog *raft.Entry
 		newMatchLog, err = s.csm.logMgr.ReadLog(ctx, newMatch, true)
 		if err != nil {
 			return
 		}
-		if newMatchLog.Term == myTerm {
+		if newMatchLog.Term == s.csm.getTerm() {
 			s.csm.getLogMgr().SetCommitIndex(newMatch)
 			s.csm.aw.asyncApply(applyUserSmReq{
 				Ctx:      context.Background(),
@@ -261,4 +258,11 @@ func (s *replicationSm) handleFollowerAppendEntriesCb(name string, ctx *context.
 		}
 	}
 	return
+}
+
+func (s *replicationSm) cleanFollowers() {
+	for k, v := range s.followers {
+		close(v.rq)
+		delete(s.followers, k)
+	}
 }

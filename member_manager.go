@@ -7,14 +7,13 @@ import (
 )
 
 type memberManager struct {
-	my     string
+	me     string
 	leader string
 	l      []string
 }
 
-func (m *memberManager) intiMember(my string, l []string) {
-	m.my = my
-	m.l = []string{my}
+func (m *memberManager) intiMember(me string, l []string) {
+	m.me = me
 	m.l = append(m.l, l...)
 }
 
@@ -28,14 +27,24 @@ func (m *memberManager) remove(v string) {
 	})
 }
 
+func (m *memberManager) getListNotMe() []string {
+	r := make([]string, 0, len(m.l))
+	for _, v := range m.l {
+		if v != m.me {
+			r = append(r, v)
+		}
+	}
+	return r
+}
+
 func (m *memberManager) getList() []string {
 	r := make([]string, 0, len(m.l))
 	r = append(r, m.l...)
 	return r
 }
 
-func (m *memberManager) getMy() string {
-	return m.my
+func (m *memberManager) getMe() string {
+	return m.me
 }
 
 func (m *memberManager) quorum() int {
