@@ -27,7 +27,6 @@ const (
 	smCommandAppendCommands
 	smCommandGetLeader
 	smCommandAsyncRequestVoteComp
-	smCommandInsertNoOp
 	smCommandAddServer
 	smCommandRemoveServer
 	smCommandApplyUserSmCb
@@ -478,11 +477,6 @@ func (s *CoreSm) startLoop() {
 						Err: err,
 					}
 				}
-			case smCommandInsertNoOp:
-				err := s.insertNoOp(cmd.ctx)
-				if err != nil {
-					slog.Error("insert noop", slog.String("err", err.Error()), slog.String("Me", s.mm.getMe()))
-				}
 			case smCommandAddServer:
 				rsp, err := s.execAddServerFromLoop(cmd.ctx, cmd.req.(*raft.AddServerReq))
 				cmd.cq <- smCommandRes{
@@ -687,10 +681,10 @@ func (s *CoreSm) execCommandAsyncRequestVoteCompFromLoop(ctx *context.Context, t
 			panic("create replicate sm failed")
 		}
 		// 插入no-op日志
-		s.q <- smCommand{
-			typ:    smCommandInsertNoOp,
-			ctx:    ctx,
-			anyReq: res,
+		err = s.insertNoOp(ctx)
+		if err != nil {
+			// slog.Error("insert noop", slog.String("err", err.Error()), slog.String("Me", s.mm.getMe()))
+			panic("insert no-op failed, err=" + err.Error())
 		}
 	}
 	return nil
